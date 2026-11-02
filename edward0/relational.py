@@ -40,15 +40,9 @@ def _shape(origins):
     return "col", rows.most_common(1)[0][0]
 
 
-def _name_table(recs):
-    """Names of the axes of one table: {axis: name}, {axis: (kind, position)}, context keys used."""
-    ctx = {}
-    for r in recs:
-        ctx.update(r["_context"])
-    origins = defaultdict(list)
-    for r in recs:
-        for j, labs in r["_axes"].items():
-            origins[j] += [o for _, o in labs.values()]
+def _name_table(ctx, origins):
+    """Names of the axes of one table: {axis: name}, {axis: (kind, position)}, context keys used.
+    ctx: {label key: (text, source cell)} of the table's context; origins: {axis: source cells}."""
     shape = {j: s for j, o in origins.items() if (s := _shape(o))}
 
     names, used = {}, set()                          # used: context keys taken as row-axis names
@@ -75,24 +69,30 @@ def _name_table(recs):
 
 
 def tables(recs, source: bool = False) -> dict:
-    """recs from clean.records() -> {dataset: pandas DataFrame} in long form, one row per value."""
+    """recs from clean.records() -> {dataset: pandas DataFrame} in long form, one row per value.
+    Columns are named from each table's metadata (recs.meta), never from per-record data."""
+    import numpy as np
     import pandas as pd
-    by_ds = defaultdict(lambda: defaultdict(list))
-    for r in recs:
-        by_ds[r["dataset"]][(r["file"], r["sheet"], r["table"])].append(r)
+    C, meta = recs.cols, recs.meta
+    if not len(recs):
+        return {}
+    ds_arr, tid_arr = np.asarray(C["dataset"]), np.asarray(C["_tid"])
 
     out = {}
-    for d in sorted(by_ds):
-        tbls = by_ds[d]
+    for d in sorted(set(C["dataset"])):
+        idx = np.flatnonzero(ds_arr == d)                                  # sheet order, row by row
+        tids = tid_arr[idx]
+        uniq, first, counts = np.unique(tids, return_index=True, return_counts=True)
+        tbls = [(int(uniq[q]), int(counts[q])) for q in np.argsort(first, kind="stable")]   # first seen first
         votes, shapes, used_by = defaultdict(Counter), {}, {}
-        for t, rs in sorted(tbls.items(), key=lambda kv: -len(kv[1])):     # largest table first
-            names, shape, used = _name_table(rs)
-            for j, n in names.items():
-                votes[j][n] += len(rs)
+        for t, n in sorted(tbls, key=lambda x: -x[1]):                     # largest table first
+            names, shape, used = _name_table(meta[t]["context"], meta[t]["origins"])
+            for j, nm in names.items():
+                votes[j][nm] += n
             for j, s in shape.items():
                 shapes.setdefault(j, s)
             used_by[t] = used
-        axes = [j for j in range(MAX_AXES) if any(r[f"axis{j + 1}"] is not None for rs in tbls.values() for r in rs)]
+        axes = [j for j in range(MAX_AXES) if any(j in meta[t]["axes"] for t, _ in tbls)]
         axes.sort(key=lambda j: ({"row": 0, "col": 1}[shapes[j][0]], shapes[j][1]) if j in shapes else (2, j))
 
         # column names, unique: a repeated name gets .2, .3 ...
@@ -102,39 +102,40 @@ def tables(recs, source: bool = False) -> dict:
             seen[n] += 1
             cols[j] = n if seen[n] == 1 else f"{n}.{seen[n]}"
 
-        rows = []
-        for t, rs in tbls.items():
-            for r in rs:
-                row = {cols[j]: r[f"axis{j + 1}"] for j in axes}
-                ctx = [txt for k, (txt, _) in r["_context"].items() if k not in used_by[t]]
-                row["context"] = " · ".join(sorted(ctx, key=str.casefold)) or None
-                row["other"] = r["other"]
-                row["value"] = r["value"]
-                if source:
-                    row.update(file=r["file"], sheet=r["sheet"], address=r["address"])
-                row["_pos"] = (r["file"], r["sheet"], r["row"], r["col"])
-                rows.append(row)
+        il = idx.tolist()
+        pick = lambda k: [C[k][i] for i in il]
+        data = {}
+        for j in axes:
+            data[cols[j]] = pick(f"axis{j + 1}")
+        ctx_text = {}
+        for t, _ in tbls:
+            ctx = [txt for k, (txt, _) in meta[t]["context"].items() if k not in used_by[t]]
+            ctx_text[t] = " · ".join(sorted(ctx, key=str.casefold)) or None
+        data["context"] = [ctx_text[t] for t in tids.tolist()]
+        data["other"] = pick("other")
+        data["value"] = pick("value")
+        if source:
+            data["file"], data["sheet"], data["address"] = pick("file"), pick("sheet"), pick("address")
 
         # ragged levels: neighbouring axes of the same kind where the lower one fixes the upper one
         for a, b in zip(axes, axes[1:]):
             if a not in shapes or b not in shapes or shapes[a][0] != shapes[b][0]:
                 continue
-            A, B = cols[a], cols[b]
+            A, B = data[cols[a]], data[cols[b]]
             up = defaultdict(set)
-            for row in rows:
-                if row[A] is not None and row[B] is not None:
-                    up[row[B]].add(row[A])
-            n_a = len({row[A] for row in rows if row[A] is not None})
+            for x, y in zip(A, B):
+                if x is not None and y is not None:
+                    up[y].add(x)
+            n_a = len({x for x in A if x is not None})
             if not up or any(len(v) > 1 for v in up.values()) or n_a >= len(up):
                 continue
-            for row in rows:
-                if row[A] is None and row[B] is not None:
-                    row[A] = row[B]
-                elif row[B] is None and row[A] is not None:
-                    row[B] = row[A]
+            for q in range(len(A)):
+                if A[q] is None and B[q] is not None:
+                    A[q] = B[q]
+                elif B[q] is None and A[q] is not None:
+                    B[q] = A[q]
 
-        rows.sort(key=lambda row: row.pop("_pos"))
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(data)
         if df["context"].nunique(dropna=False) <= 1:      # the same on every row: not a column
             df = df.drop(columns="context")
         if df["other"].isna().all():
