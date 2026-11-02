@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+edward0/__init__.py
+edward0/clean.py
+edward0/extract.py
+edward_0.egg-info/PKG-INFO
+edward_0.egg-info/SOURCES.txt
+edward_0.egg-info/dependency_links.txt
+edward_0.egg-info/requires.txt
+edward_0.egg-info/top_level.txt

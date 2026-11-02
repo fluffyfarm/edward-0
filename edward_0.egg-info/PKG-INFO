@@ -1,0 +1,40 @@
+Metadata-Version: 2.4
+Name: edward-0
+Version: 0.1.0
+Summary: Spreadsheets to relational records: one row per value, dimensions found from label sets
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: pandas>=1.5
+
+# edward-0
+
+Spreadsheets → relational records. Every number in a workbook becomes one row with the
+labels that identify it, grouped into unnamed dimensions.
+
+```bash
+pip install -e .
+```
+
+```python
+import edward0 as cleaner
+
+df = cleaner.read("book.xlsx")        # a file, a folder, or a list of them
+df[["sheet", "address", "value", "context", "axis1", "axis2"]]
+
+cells = cleaner.cells("book.xlsx")    # first step only: value cells with their labels
+```
+
+| column | meaning |
+|---|---|
+| `file`, `sheet`, `table`, `address` | where the value is |
+| `value` | the value, as Excel last calculated it |
+| `dataset` | tables with matching dimensions share a number (1 = largest) |
+| `context` | labels on every cell of the table (title, unit …) |
+| `axis1` … `axis6` | the cell's label on each dimension |
+| `other`, `dropped` | labels of smaller dimensions; errors and notes left out |
+| `labels` | all kept labels of the cell, to check the row by eye |
+| `dup` | records with the same key in the dataset (1 = unique; > 1 = a dimension is missing) |
+
+By default cells calculated from other cells are left out (`read(..., raw_only=False)`
+keeps them). See `ALGORITHM.md` for how it works.

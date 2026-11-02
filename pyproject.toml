@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edward-0"
+version = "0.1.0"
+description = "Spreadsheets to relational records: one row per value, dimensions found from label sets"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["openpyxl>=3.1", "pandas>=1.5"]
+
+[tool.setuptools]
+packages = ["edward0"]
