@@ -55,38 +55,47 @@ def jaccard(a: set, b: set) -> float:
 # --------------------------------------------------------------------------- #
 # Axes inside one table
 # --------------------------------------------------------------------------- #
-def table_axes(cells: list[frozenset]):
+def table_axes(cells):
     """cells: label-key sets of the table's cells.
-    Returns (context labels, axes) where axes is a list of label sets, largest coverage first."""
+    Returns (context labels, axes) where axes is a list of label sets, largest coverage first.
+
+    Linear in the cells: no per-label cell bitmasks (they were O(cells^2) memory on large tables).
+    Two labels share a cell iff one is a partner of the other, so 'sits on the same cell as a
+    member' is partners[k] ∩ members != ∅; and partners(axis) − members is kept up to date."""
     n = len(cells)
     count = Counter(k for s in cells for k in s)
     constants = {k for k, v in count.items() if v == n} if n > 1 else set(count)
-    bits, partners = defaultdict(int), defaultdict(set)
-    for i, s in enumerate(cells):
-        var = s - constants
+    partners = defaultdict(set)
+    for s in cells:
+        var = s - constants if constants else s
         for k in var:
-            bits[k] |= 1 << i
             partners[k] |= var
-    for k in partners:
-        partners[k].discard(k)
+    for k, p in partners.items():
+        p.discard(k)
 
-    axes = []                      # [members, cell bits, partner labels]
-    for k in sorted(bits, key=lambda x: (-count[x], x)):
+    axes = []                                   # [members, partners of members − members]
+    for k in sorted(partners, key=lambda x: (-count[x], x)):
+        p = partners[k]
         best, best_score = None, SAME_AXIS
         for ax in axes:
-            if bits[k] & ax[1]:
-                continue                                    # sits on the same cell: not the same axis
-            score = jaccard(partners[k], ax[2] - ax[0])
+            if not p.isdisjoint(ax[0]):
+                continue                        # sits on the same cell as a member
+            inter = len(p & ax[1])
+            union = len(p) + len(ax[1]) - inter
+            score = inter / union if union else 1.0
             if score >= best_score:
                 best, best_score = ax, score
         if best is None:
-            axes.append([{k}, bits[k], set(partners[k])])
+            axes.append([{k}, set(p)])
         else:
             best[0].add(k)
-            best[1] |= bits[k]
-            best[2] |= partners[k]
-    axes.sort(key=lambda ax: (-bin(ax[1]).count("1"), min(ax[0])))
-    return constants, [ax[0] for ax in axes]
+            best[1] |= p                        # p has no member and not k (checked above)
+    axis_of = {k: i for i, ax in enumerate(axes) for k in ax[0]}
+    cover = Counter()
+    for s in cells:
+        cover.update({axis_of[k] for k in s if k in axis_of})
+    order = sorted(range(len(axes)), key=lambda i: (-cover[i], min(axes[i][0])))
+    return constants, [axes[i][0] for i in order]
 
 
 # --------------------------------------------------------------------------- #
