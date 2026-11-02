@@ -20,8 +20,11 @@ from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, time as dtime
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl import load_workbook
+from openpyxl.cell.read_only import ReadOnlyCell
+from openpyxl.styles.numbers import is_date_format
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet._reader import WorkSheetParser
 
 # --------------------------------------------------------------------------- #
 # Values and labels
@@ -127,36 +130,40 @@ def cell_value(v, has_formula: bool):
 # One worksheet as a grid
 # --------------------------------------------------------------------------- #
 class Grid:
-    """Cached values, formulas, number formats and merged ranges of one worksheet."""
+    """Cached values, formulas, number formats and merged ranges of one worksheet.
+    Built by grid_xlsx() (a sheet read in read-only mode) or grid_csv()."""
 
-    def __init__(self, ws_f, ws_v):
+    def __init__(self):
         self.value: dict[tuple[int, int], object] = {}
         self.formula: dict[tuple[int, int], str] = {}
         self.fmt: dict[tuple[int, int], str] = {}
-        for row in ws_f.iter_rows():
-            for c in row:
-                v = c.value
-                if v is None:
-                    continue
-                rc = (c.row, c.column)
-                if isinstance(v, str) and v.startswith("="):
-                    self.formula[rc] = v
-                elif hasattr(v, "text") and not isinstance(v, str):          # ArrayFormula / DataTableFormula
-                    self.formula[rc] = getattr(v, "text", None) or str(v)
-                else:
-                    self.value[rc] = v
-                if c.is_date:
-                    self.fmt[rc] = c.number_format
-        for rc in self.formula:                                              # cached results
-            cv = ws_v.cell(*rc)
-            self.value[rc] = cv.value
-            if cv.is_date:
-                self.fmt[rc] = ws_f.cell(*rc).number_format
         self.anchor: dict[tuple[int, int], tuple[int, int]] = {}
-        for mr in ws_f.merged_cells.ranges:
-            top = (mr.min_row, mr.min_col)
-            for r in range(mr.min_row, mr.max_row + 1):
-                for c in range(mr.min_col, mr.max_col + 1):
+
+    def put(self, rc, v, is_date: bool = False, number_format: str | None = None):
+        """One cell of the sheet with formulas (as stored, not calculated)."""
+        if v is None:
+            return
+        if isinstance(v, str) and v.startswith("="):
+            self.formula[rc] = v
+        elif hasattr(v, "text") and not isinstance(v, str):              # ArrayFormula / DataTableFormula
+            self.formula[rc] = getattr(v, "text", None) or str(v)
+        else:
+            self.value[rc] = v
+        if is_date:
+            self.fmt[rc] = number_format
+
+    def merge(self, refs):
+        """Merged ranges ('A1:C2'). As openpyxl does on a normal load, only the top-left cell of a
+        range keeps its content; the cells it covers are emptied."""
+        for ref in refs:
+            c0, r0, c1, r1 = range_boundaries(ref)
+            top = (r0, c0)
+            for r in range(r0, r1 + 1):
+                for c in range(c0, c1 + 1):
+                    if (r, c) != top:
+                        self.value.pop((r, c), None)
+                        self.formula.pop((r, c), None)
+                        self.fmt.pop((r, c), None)
                     self.anchor[(r, c)] = top
 
     def raw(self, r, c):
@@ -552,15 +559,66 @@ def csv_value(s: str):
     return int(x) if x.is_integer() and not pct else x
 
 
-def csv_workbook(path: str) -> Workbook:
-    """A CSV file as a one-sheet workbook (sheet named after the file)."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(os.path.basename(path))[0])[:31]
+def grid_csv(path: str) -> Grid:
+    """A CSV file as a Grid, cell by cell as Excel would hold it (a text starting with '=' is a
+    formula, and is also its own cached value)."""
+    g = Grid()
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
-        for row in csv.reader(f):
-            ws.append([csv_value(v) for v in row])
-    return wb
+        for r, row in enumerate(csv.reader(f), 1):
+            for c, field in enumerate(row, 1):
+                v = csv_value(field)
+                if isinstance(v, str):
+                    v = v[:32767]                                        # Excel's cell limit
+                g.put((r, c), v)
+                if (r, c) in g.formula:
+                    g.value[(r, c)] = v
+    return g
+
+
+def _sheet_rows(ws, merges: list | None = None):
+    """The cells of a read-only worksheet as openpyxl's sheet parser reads them (the same parser a
+    normal load uses): dicts with row, column, value, data_type, style_id. When the rows are done,
+    the sheet's merged ranges (stored after them) are added to `merges`."""
+    wb = ws.parent
+    with ws._get_source() as src:
+        parser = WorkSheetParser(src, ws._shared_strings, data_only=wb.data_only, epoch=wb.epoch,
+                                 date_formats=wb._date_formats, timedelta_formats=wb._timedelta_formats)
+        for _, row in parser.parse():
+            yield from row
+        if merges is not None and parser.merged_cells:
+            merges += [cr.ref for cr in parser.merged_cells.mergeCell]
+
+
+def grid_xlsx(ws_f, ws_v) -> Grid:
+    """One sheet, read in read-only mode: formulas from ws_f, their cached results from ws_v
+    (the same sheet of the workbook opened with data_only=True)."""
+    styles = {}
+
+    def style(ws, sid):                                  # number format and is-date, per style
+        if sid not in styles:
+            nf = ReadOnlyCell(ws, 1, 1, None, "n", sid).number_format
+            styles[sid] = (nf, is_date_format(nf))
+        return styles[sid]
+
+    def is_date(ws, cell):                               # as openpyxl's Cell.is_date
+        t = cell["data_type"]
+        return t == "d" or (t == "n" and style(ws, cell["style_id"])[1])
+
+    g, merges = Grid(), []
+    for cell in _sheet_rows(ws_f, merges):
+        d = is_date(ws_f, cell)
+        g.put((cell["row"], cell["column"]), cell["value"], d, style(ws_f, cell["style_id"])[0] if d else None)
+    g.merge(merges)
+    if g.formula:                                        # cached results
+        for rc in g.formula:
+            g.value[rc] = None
+        for cell in _sheet_rows(ws_v):
+            rc = (cell["row"], cell["column"])
+            if rc in g.formula:
+                g.value[rc] = cell["value"]
+                if is_date(ws_v, cell):
+                    g.fmt[rc] = style(ws_v, cell["style_id"])[0]
+    return g
 
 
 def extract(path: str) -> list[dict]:
@@ -577,23 +635,22 @@ def extract_sheets(path: str):
     Only one sheet's grid and cells are held at a time."""
     name = os.path.basename(path)
     if path.lower().endswith(".csv"):
-        wb_f = wb_v = csv_workbook(path)
-    else:
-        wb_f = load_workbook(path, data_only=False)
-        wb_v = load_workbook(path, data_only=True)
+        title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(name)[0])[:31]
+        yield _sheet_cells(name, title, grid_csv(path))
+        return
+    wb_f = load_workbook(path, read_only=True, data_only=False)     # read-only: one sheet at a time
+    wb_v = load_workbook(path, read_only=True, data_only=True)
     try:
         for ws in wb_f.worksheets:
-            yield _sheet_cells(name, ws, wb_v[ws.title])
+            yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title]))
     finally:
-        if wb_f is not wb_v:
-            wb_v.close()
+        wb_v.close()
         wb_f.close()
 
 
-def _sheet_cells(name: str, ws, ws_v) -> list[dict]:
+def _sheet_cells(name: str, sheet: str, g: Grid) -> list[dict]:
     """The value cells of one worksheet with their labels."""
     out = []
-    g = Grid(ws, ws_v)
     layout = Layout(g)
 
     # tables, and label-only blocks just above them (captions)
@@ -668,7 +725,7 @@ def _sheet_cells(name: str, ws, ws_v) -> list[dict]:
                         seen.add(lb.key())
                         labels.append(lb)
                         via.append(src)
-            out.append({"file": name, "sheet": ws.title, "table": t.ref,
+            out.append({"file": name, "sheet": sheet, "table": t.ref,
                         "address": f"{get_column_letter(c)}{r}", "row": r, "col": c,
                         "value_type": v[0], "value": v[1], "formula": g.formula.get((r, c)),
                         "via": via,
