@@ -98,6 +98,66 @@ def table_axes(cells):
     return constants, [axes[i][0] for i in order]
 
 
+def table_axes_csr(indptr, kids, names: list[str]):
+    """table_axes() on the table's cells x keys matrix in CSR form: cell i has the keys
+    kids[indptr[i]:indptr[i + 1]] (numpy arrays, no key twice on a cell); names[k] is key k.
+
+    Same rules and result as table_axes(), computed from the matrix: count = column sums,
+    partners = keys on the same cell (A^T A), coverage = cells with a key of the axis.
+    Returns (constant keys, axes), keys as ids; each axis lists its keys in the order they joined,
+    axes largest coverage first."""
+    import numpy as np
+    n, K = len(indptr) - 1, len(names)
+    count = np.bincount(kids, minlength=K)
+    const = (count == n) if n > 1 else (count > 0)
+    constants = set(np.flatnonzero(const).tolist())
+    cell = np.repeat(np.arange(n, dtype=np.int64), np.diff(indptr))
+    var = ~const[kids]
+    vc, vk = cell[var], kids[var].astype(np.int64)
+
+    # partners: pairs of keys on the same cell (a cell's keys are contiguous in vc / vk)
+    codes = []
+    width = int(np.bincount(vc).max()) if len(vc) else 0
+    for d in range(1, width):
+        same = vc[d:] == vc[:-d]
+        a, b = vk[:-d][same], vk[d:][same]
+        codes += [a * K + b, b * K + a]
+    pc = np.unique(np.concatenate(codes)) if codes else np.empty(0, np.int64)
+    start = np.searchsorted(pc // K, np.arange(K + 1)).tolist()
+    pb = pc % K
+    del codes, pc
+
+    cnt = count.tolist()
+    axes = []                                   # [members, partners of members - members, members in order]
+    for k in sorted(np.flatnonzero((count > 0) & ~const).tolist(), key=lambda x: (-cnt[x], names[x])):
+        p = set(pb[start[k]:start[k + 1]].tolist())
+        best, best_score = None, SAME_AXIS
+        for ax in axes:
+            if not p.isdisjoint(ax[0]):
+                continue                        # sits on the same cell as a member
+            inter = len(p & ax[1])
+            union = len(p) + len(ax[1]) - inter
+            score = inter / union if union else 1.0
+            if score >= best_score:
+                best, best_score = ax, score
+        if best is None:
+            axes.append([{k}, p, [k]])
+        else:
+            best[0].add(k)
+            best[1] |= p                        # p has no member and not k (checked above)
+            best[2].append(k)
+
+    A = len(axes)
+    if not A:
+        return constants, []
+    axis_of = np.full(K, -1, dtype=np.int64)
+    for i, ax in enumerate(axes):
+        axis_of[ax[2]] = i
+    cover = np.bincount(np.unique(vc * A + axis_of[vk]) % A, minlength=A).tolist()
+    order = sorted(range(A), key=lambda i: (-cover[i], min(names[k] for k in axes[i][2])))
+    return constants, [axes[i][2] for i in order]
+
+
 # --------------------------------------------------------------------------- #
 # Datasets across tables
 # --------------------------------------------------------------------------- #
@@ -170,76 +230,173 @@ class Records:
         return len(self.cols["value"])
 
 
+def _order(text: str):
+    """Labels in a record: case-insensitive, then exact text (so 'TUFA' before 'Tufa' every run)."""
+    return text.casefold(), text
+
+
 def _show(keys, own):
     """A record shows its cell's own spelling of each label."""
-    return " · ".join(sorted({x for k in keys for x in own[k]}, key=str.casefold)) or None
+    return " · ".join(sorted({x for k in keys for x in own[k]}, key=_order)) or None
 
 
 class _Table:
     """One table after steps 1-3, kept compact: its axes, its table metadata and one entry per
-    value cell in column lists (the cell dicts and their Label objects are not kept)."""
+    value cell in column lists."""
     __slots__ = ("key", "n", "constants", "main", "cols", "ax", "context", "origins")
 
 
-def _sheet_tables(cells: list[dict], raw_only: bool, pool: dict, keep_index: bool) -> list[_Table]:
-    """Steps 1-3 on one sheet's cells: clean labels, raw data only, axes per table.
+def _sheet_tables(sheet, raw_only: bool, pool: dict, keep_index: bool) -> list[_Table]:
+    """Steps 1-3 on one sheet (extract.SheetCells): clean labels, raw data only, axes per table.
+    Labels are cleaned once per distinct label; a table is a cells x keys matrix.
     pool: shared strings, so a label's text is stored once however many records show it."""
+    import numpy as np
+    from openpyxl.utils import get_column_letter
+
     share = lambda x: pool.setdefault(x, x) if x is not None else None
+    L = sheet.labels
 
-    # 1. clean labels, 2. raw data only; cells without any kept label cannot be placed and are left out
-    by_table = defaultdict(list)
-    for c in cells:
-        if c["value_type"] in ("error", "none") or (raw_only and not is_raw(c["formula"])):
-            continue
-        keys, own, dropped, origin = set(), defaultdict(set), [], {}
-        for lb, via in zip(c["labels"], c["via"]):
-            text = share(" ".join(lb.text.split()))
-            key, reason = clean_key(lb.text, lb.date_value, via == "header")
-            if reason is None:
-                keys.add(key)
-                own[key].add(text)
-                origin.setdefault(key, lb.origin)               # where the label was read (first source)
-            else:
-                dropped.append(text)
-        if keys:
-            by_table[(c["file"], c["sheet"], c["table"])].append((c, frozenset(keys), own, dropped, origin))
+    # 1. clean labels: once per distinct label; kid_of[label] = key id, or -1 for a dropped label
+    kid_of, disp, names, kid_by_key = [], [], [], {}
+    for text, date_value, via in zip(L.text, L.date_value, L.via):
+        key, reason = clean_key(text, date_value, via == "header")
+        disp.append(share(" ".join(text.split())))
+        if reason is None:
+            k = kid_by_key.get(key)
+            if k is None:
+                k = kid_by_key[key] = len(names)
+                names.append(key)
+            kid_of.append(k)
+        else:
+            kid_of.append(-1)
+    kid_arr = np.array(kid_of, dtype=np.int64)
+    K, origin = len(names), L.origin
+    letters = {}
 
-    # 3. axes per table
+    def gtext(lids):                                             # _show() for the labels of one part
+        if len(lids) == 1:
+            return disp[lids[0]]
+        return share(" · ".join(sorted({disp[x] for x in lids}, key=_order)))
+
     out = []
-    for t, items in by_table.items():
-        constants, axes = table_axes([x[1] for x in items])
-        main, rest = axes[:MAX_AXES], axes[MAX_AXES:]
-        rest_keys = set().union(*rest) if rest else set()
-        items.sort(key=lambda x: (x[0]["row"], x[0]["col"]))    # sheet order: the metadata below
+    for tc in sheet.tables:
+        n0 = len(tc)
+        if not n0 or not K:
+            continue
+        # 2. raw data only; cells without any kept label cannot be placed and are left out
+        ok = np.frombuffer(tc.vtype, dtype=np.int8) < 4                   # not error / none
+        if raw_only:
+            for i, f in tc.formula.items():
+                if not is_raw(f):
+                    ok[i] = False
+        off = np.frombuffer(tc.off, dtype=np.int64)
+        lab = np.frombuffer(tc.lab, dtype=np.int32)
+        cell = np.repeat(np.arange(n0, dtype=np.int64), np.diff(off))
+        ek = kid_arr[lab]
+        has = np.bincount(cell[ek >= 0], minlength=n0) > 0
+        use = ok & has
+        keep = np.flatnonzero(use)
+        if not len(keep):
+            continue
+
+        # 3. axes: the cells x keys matrix (CSR, no key twice on a cell)
+        sel = (ek >= 0) & use[cell]
+        pairs = np.unique(cell[sel] * K + ek[sel])
+        pos = np.full(n0, -1, dtype=np.int64)
+        pos[keep] = np.arange(len(keep))
+        indptr = np.searchsorted(pos[pairs // K], np.arange(len(keep) + 1))
+        const_k, axes_k = table_axes_csr(indptr, pairs % K, names)
+        del pairs, sel, cell, ek
+
+        constants = {names[k] for k in const_k}
+        main_k, rest_k = axes_k[:MAX_AXES], axes_k[MAX_AXES:]
+        main = [{names[k] for k in a} for a in main_k]          # same insertion order as table_axes()
+        G = len(main_k) + 1                                      # part of a key: 0 context, 1.. axis, G other
+        grp = [-1] * K
+        for k in const_k:
+            grp[k] = 0
+        for i, a in enumerate(main_k):
+            for k in a:
+                grp[k] = 1 + i
+        for a in rest_k:
+            for k in a:
+                grp[k] = G
+
+        rows = np.frombuffer(tc.row, dtype=np.int32)
+        cols_ = np.frombuffer(tc.col, dtype=np.int32)
+        order = keep[np.lexsort((cols_[keep], rows[keep]))].tolist()      # sheet order: the metadata below
         cols = {k: [] for k in ("address", "row", "col", "value", "is_formula", "context", "other", "dropped")}
         if keep_index:
             cols["_index"] = []
-        ax = [[] for _ in main]                                  # label on each axis, by the table's own axis order
-        context, origins = {}, [{} for _ in main]               # origins: source cells, first seen first
-        first = {}                                               # axis -> (first record with it, axis)
-        for q, (c, keys, own, dropped, origin) in enumerate(items):
-            ctx = constants & keys
-            cols["address"].append(c["address"])
-            cols["row"].append(c["row"])
-            cols["col"].append(c["col"])
-            cols["value"].append(c["value"])
-            cols["is_formula"].append(c["formula"] is not None)
-            cols["context"].append(share(_show(ctx, own)))
-            for i, a in enumerate(main):
-                h = keys & a
-                ax[i].append(share(_show(h, own)) if h else None)
-                if h and i not in first:
-                    first[i] = (q, i)
-                for k in h:
-                    origins[i].setdefault(origin.get(k))
-            cols["other"].append(share(_show(keys & rest_keys, own)))
-            cols["dropped"].append(share(" · ".join(sorted(dropped, key=str.casefold)) or None))
+        c_addr, c_row, c_col, c_val, c_isf = (cols[k] for k in ("address", "row", "col", "value", "is_formula"))
+        c_ctx, c_oth, c_drop = cols["context"], cols["other"], cols["dropped"]
+        c_idx = cols.get("_index")
+        ax = [[] for _ in main_k]
+        origins, first = [{} for _ in main_k], {}
+        lab_l, off_l, row_l, col_l, formula = tc.lab, tc.off, tc.row, tc.col, tc.formula
+        nax = len(main_k)
+        last = None
+        for q, i in enumerate(order):
+            parts, dropped, kept = {}, [], []
+            for j in range(off_l[i], off_l[i + 1]):
+                lid = lab_l[j]
+                k = kid_of[lid]
+                if k < 0:
+                    dropped.append(disp[lid])
+                else:
+                    kept.append(lid)
+                    g = grp[k]
+                    if g in parts:
+                        parts[g].append(lid)
+                    else:
+                        parts[g] = [lid]
+            r, c = row_l[i], col_l[i]
+            letter = letters.get(c)
+            if letter is None:
+                letter = letters[c] = get_column_letter(c)
+            c_addr.append(f"{letter}{r}")
+            c_row.append(r)
+            c_col.append(c)
+            c_val.append(tc.value[i])
+            c_isf.append(i in formula)
+            p = parts.get(0)
+            c_ctx.append(gtext(p) if p else None)
+            for a in range(nax):
+                p = parts.get(1 + a)
+                if p is None:
+                    ax[a].append(None)
+                    continue
+                ax[a].append(gtext(p))
+                if a not in first:
+                    first[a] = (q, a)
+                ks = {kid_of[x] for x in p}
+                if len(ks) == 1:
+                    origins[a].setdefault(origin[p[0]])
+                else:                                            # several keys on one axis: in the order
+                    fo, keys = {}, set()                         # table_axes()' sets give them
+                    for x in kept:
+                        keys.add(names[kid_of[x]])
+                        fo.setdefault(names[kid_of[x]], origin[x])
+                    for key in frozenset(keys) & main[a]:
+                        origins[a].setdefault(fo[key])
+            p = parts.get(G)
+            c_oth.append(gtext(p) if p else None)
+            c_drop.append(share(" · ".join(sorted(dropped, key=str.casefold))) if dropped else None)
             if keep_index:
-                cols["_index"].append(frozenset(x for v in own.values() for x in v))
-            for k in ctx:                                        # the table's context labels, with the
-                context[k] = (_show({k}, own), origin.get(k))    # spelling of the last cell in sheet order
+                c_idx.append(frozenset(disp[x] for x in kept))
+            last = kept
+
+        # the table's context labels, with the spelling of the last cell in sheet order
+        context, own, fo = {}, {}, {}
+        for x in last:
+            key = names[kid_of[x]]
+            own.setdefault(key, set()).add(disp[x])
+            fo.setdefault(key, origin[x])
+        for key in constants & set(own):
+            context[key] = (_show({key}, own), fo[key])
+
         tb = _Table()
-        tb.key, tb.n, tb.constants, tb.main = t, len(items), constants, main
+        tb.key, tb.n, tb.constants, tb.main = (sheet.file, sheet.sheet, tc.ref), len(order), constants, main
         tb.cols, tb.ax, tb.context = cols, ax, context
         tb.origins = {i: origins[i] for i in sorted(first, key=first.get)}   # axes in the order records show them
         out.append(tb)
@@ -249,8 +406,8 @@ def _sheet_tables(cells: list[dict], raw_only: bool, pool: dict, keep_index: boo
 def records(cells, raw_only: bool = True, keep_index: bool = True) -> Records:
     """cells from extract -> one record per value, as Records (columns + per-table metadata).
 
-    cells:      an iterable of sheets, each a list of cell dicts (extract.extract_sheets), or one flat
-                list of cell dicts (extract.extract). A table must not be split across sheets. Each
+    cells:      an iterable of sheets (extract.extract_sheets: SheetCells, or lists of cell dicts), or
+                one flat list of cell dicts (extract.extract). A table must not be split across sheets. Each
                 sheet is reduced to its tables' axes and compact columns before the next one is read;
                 datasets are matched once all sheets are in.
     keep_index: keep `_index`, the set of each record's labels (for raw() and read()'s `index`).
@@ -260,11 +417,14 @@ def records(cells, raw_only: bool = True, keep_index: bool = True) -> Records:
     import numpy as np
     import pandas as pd
 
+    from .extract import SheetCells
+
     if isinstance(cells, list) and (not cells or isinstance(cells[0], dict)):
-        cells = [cells]
+        cells = SheetCells.from_dicts(cells)
     pool, tables = {}, []
     for sheet in cells:
-        tables += _sheet_tables(sheet, raw_only, pool, keep_index)
+        for sc in SheetCells.from_dicts(sheet) if isinstance(sheet, list) else [sheet]:
+            tables += _sheet_tables(sc, raw_only, pool, keep_index)
         del sheet
     pool.clear()
 

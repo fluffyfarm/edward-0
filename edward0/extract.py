@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+from array import array
 from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, time as dtime
@@ -537,6 +538,105 @@ class Layout:
 
 
 # --------------------------------------------------------------------------- #
+# Value cells in columns
+# --------------------------------------------------------------------------- #
+VALUE_TYPES = ("number", "text", "date", "bool", "error", "none")
+_VTYPE = {t: i for i, t in enumerate(VALUE_TYPES)}
+
+
+class Labels:
+    """The distinct labels of one sheet. A label is one text and date, read from one cell, by one
+    source (header | title | layout); cells refer to labels by id."""
+    __slots__ = ("ids", "text", "date_value", "origin", "via")
+
+    def __init__(self):
+        self.ids: dict = {}
+        self.text, self.date_value, self.origin, self.via = [], [], [], []
+
+    def id(self, lb: Label, via: str) -> int:
+        k = (lb.text, lb.date_value, lb.origin, via)
+        i = self.ids.get(k)
+        if i is None:
+            i = self.ids[k] = len(self.text)
+            self.text.append(lb.text)
+            self.date_value.append(lb.date_value)
+            self.origin.append(lb.origin)
+            self.via.append(via)
+        return i
+
+
+class TableCells:
+    """The value cells of one table, in columns: cell i is at row[i], col[i] with value_type
+    VALUE_TYPES[vtype[i]] and value[i]; formula: {i: formula}. Its labels are
+    lab[off[i]:off[i + 1]] (ids into the sheet's Labels), in order header, title, layout."""
+    __slots__ = ("ref", "row", "col", "vtype", "value", "formula", "off", "lab")
+
+    def __init__(self, ref: str):
+        self.ref = ref
+        self.row, self.col, self.vtype = array("i"), array("i"), array("b")
+        self.value: list = []
+        self.formula: dict[int, str] = {}
+        self.off, self.lab = array("q", [0]), array("i")
+
+    def __len__(self):
+        return len(self.value)
+
+    def add(self, r, c, value_type, value, formula, label_ids):
+        if formula is not None:
+            self.formula[len(self.value)] = formula
+        self.row.append(r)
+        self.col.append(c)
+        self.vtype.append(_VTYPE[value_type])
+        self.value.append(value)
+        self.lab.extend(label_ids)
+        self.off.append(len(self.lab))
+
+
+class SheetCells:
+    """The value cells of one sheet: its distinct labels, and its tables' cells in columns."""
+    __slots__ = ("file", "sheet", "labels", "tables")
+
+    def __init__(self, file: str, sheet: str):
+        self.file, self.sheet, self.labels, self.tables = file, sheet, Labels(), []
+
+    def __len__(self):
+        return sum(len(t) for t in self.tables)
+
+    def dicts(self) -> list[dict]:
+        """The cells as dicts (extract()'s form): file, sheet, table, address, row, col,
+        value_type, value, formula, via, labels."""
+        L, out = self.labels, []
+        for t in self.tables:
+            for i in range(len(t)):
+                ids = t.lab[t.off[i]:t.off[i + 1]]
+                r, c = t.row[i], t.col[i]
+                out.append({"file": self.file, "sheet": self.sheet, "table": t.ref,
+                            "address": f"{get_column_letter(c)}{r}", "row": r, "col": c,
+                            "value_type": VALUE_TYPES[t.vtype[i]], "value": t.value[i],
+                            "formula": t.formula.get(i),
+                            "via": [L.via[j] for j in ids],
+                            "labels": [Label(L.text[j], L.date_value[j], L.origin[j]) for j in ids]})
+        return out
+
+    @staticmethod
+    def from_dicts(cells: list[dict]) -> list["SheetCells"]:
+        """Cell dicts (extract()'s form) -> one SheetCells per sheet, in the order first seen."""
+        sheets: dict = {}
+        tables: dict = {}
+        for d in cells:
+            sc = sheets.get((d["file"], d["sheet"]))
+            if sc is None:
+                sc = sheets[(d["file"], d["sheet"])] = SheetCells(d["file"], d["sheet"])
+            tc = tables.get((d["file"], d["sheet"], d["table"]))
+            if tc is None:
+                tc = tables[(d["file"], d["sheet"], d["table"])] = TableCells(d["table"])
+                sc.tables.append(tc)
+            tc.add(d["row"], d["col"], d["value_type"], d["value"], d["formula"],
+                   [sc.labels.id(lb, via) for lb, via in zip(d["labels"], d["via"])])
+        return list(sheets.values())
+
+
+# --------------------------------------------------------------------------- #
 # Files
 # --------------------------------------------------------------------------- #
 _CSV_NUM = re.compile(r"^\(?-?[\d,]*\.?\d+\)?%?$")
@@ -628,11 +728,11 @@ def extract(path: str, sheets=None) -> list[dict]:
     Returns dicts: file, sheet, table, address, row, col, value_type, value, formula,
     labels (list of Label, unordered in meaning), via (where each label came from:
     header | title | layout; same order as labels)."""
-    return [c for sheet in extract_sheets(path, sheets) for c in sheet]
+    return [c for sheet in extract_sheets(path, sheets) for c in sheet.dicts()]
 
 
 def extract_sheets(path: str, sheets=None, names: list | None = None):
-    """Like extract(), one sheet at a time: yields the value cells of each sheet as a list.
+    """Like extract(), one sheet at a time: yields the value cells of each sheet as SheetCells.
     Only one sheet's grid and cells are held at a time; sheets not asked for are not read.
     names: a list to receive the names of all sheets in the file."""
     want = {sheets} if isinstance(sheets, str) else set(sheets) if sheets is not None else None
@@ -657,9 +757,10 @@ def extract_sheets(path: str, sheets=None, names: list | None = None):
         wb_f.close()
 
 
-def _sheet_cells(name: str, sheet: str, g: Grid) -> list[dict]:
+def _sheet_cells(name: str, sheet: str, g: Grid) -> SheetCells:
     """The value cells of one worksheet with their labels."""
-    out = []
+    out = SheetCells(name, sheet)
+    label_id = out.labels.id
     layout = Layout(g)
 
     # tables, and label-only blocks just above them (captions)
@@ -720,11 +821,13 @@ def _sheet_cells(name: str, sheet: str, g: Grid) -> list[dict]:
             return floors[c]
 
         c0, c1 = box[1], box[3]
+        tc = TableCells(t.ref)
+        out.tables.append(tc)
         for r, c, header in table_cells(g, t):
             v = cell_value(g.raw(r, c), (r, c) in g.formula)
             if v is None:
                 continue
-            labels, via, seen = [], [], set()
+            ids, seen = [], set()
             head_end = min(r - 1, t.col_header_rows.get(c, t.header_rows)[-1])
             for src, lbs in (("header", header), ("title", t.title_labels),
                              ("layout", layout.labels(r, c, c0, c1, box[0], floor(c), head_end,
@@ -732,11 +835,7 @@ def _sheet_cells(name: str, sheet: str, g: Grid) -> list[dict]:
                 for lb in lbs:
                     if lb.key() not in seen:              # first source wins: header > title > layout
                         seen.add(lb.key())
-                        labels.append(lb)
-                        via.append(src)
-            out.append({"file": name, "sheet": sheet, "table": t.ref,
-                        "address": f"{get_column_letter(c)}{r}", "row": r, "col": c,
-                        "value_type": v[0], "value": v[1], "formula": g.formula.get((r, c)),
-                        "via": via,
-                        "labels": labels})
+                        ids.append(label_id(lb, src))
+            tc.add(r, c, v[0], v[1], g.formula.get((r, c)), ids)
+    out.tables = [tc for tc in out.tables if len(tc)]
     return out

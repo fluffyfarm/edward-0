@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 
-from .clean import COLUMNS, records
+from .clean import COLUMNS, _order, records
 from .extract import extract, extract_sheets
 from .relational import tables as _tables
 
@@ -57,7 +57,7 @@ def _sheets(src, sheets=None):
 
 
 def _extract_all(src, sheets=None) -> list[dict]:
-    return [c for sheet in _sheets(src, sheets) for c in sheet]
+    return [c for sheet in _sheets(src, sheets) for c in sheet.dicts()]
 
 
 def cells(src, sheets=None):
@@ -99,7 +99,7 @@ def read(src, raw_only: bool = True, sheets=None):
     import pandas as pd
     c = records(_sheets(src, sheets), raw_only=raw_only).cols
     data = {k: c[k] for k in COLUMNS[:COLUMNS.index("is_formula")]}
-    data["index"] = [" · ".join(sorted(ix, key=str.casefold)) for ix in c["_index"]]
+    data["index"] = [" · ".join(sorted(ix, key=_order)) for ix in c["_index"]]
     data["is_formula"], data["dup"] = c["is_formula"], c["dup"]
     return pd.DataFrame(data)
 
