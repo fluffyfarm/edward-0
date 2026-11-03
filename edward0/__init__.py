@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import os
 
-from .clean import records
-from .extract import extract
+from .clean import COLUMNS, records
+from .extract import extract, extract_sheets
 from .relational import tables as _tables
 
 __all__ = ["read", "raw", "tables", "cells"]
@@ -46,6 +46,12 @@ def _extract_all(src) -> list[dict]:
     for p in _paths(src):
         out += extract(p)
     return out
+
+
+def _sheets(src):
+    """Every sheet of every file, one at a time (a list of value cells per sheet)."""
+    for p in _paths(src):
+        yield from extract_sheets(p)
 
 
 def cells(src):
@@ -82,11 +88,11 @@ def read(src, raw_only: bool = True):
       dup                          records in the dataset with the same key (1 = unique)
     """
     import pandas as pd
-    recs = records(_extract_all(src), raw_only=raw_only)
-    cols = ["file", "sheet", "table", "address", "row", "col", "value", "dataset", "context",
-            "axis1", "axis2", "axis3", "axis4", "axis5", "axis6",
-            "other", "dropped", "labels", "is_formula", "dup"]
-    return pd.DataFrame(recs, columns=cols).rename(columns={"labels": "index"})
+    c = records(_sheets(src), raw_only=raw_only).cols
+    data = {k: c[k] for k in COLUMNS[:COLUMNS.index("is_formula")]}
+    data["index"] = [" · ".join(sorted(ix, key=str.casefold)) for ix in c["_index"]]
+    data["is_formula"], data["dup"] = c["is_formula"], c["dup"]
+    return pd.DataFrame(data)
 
 
 def raw(src, raw_only: bool = True):
@@ -98,10 +104,8 @@ def raw(src, raw_only: bool = True):
       value    the value
       dataset  tables with matching axes share a number (1 = largest)"""
     import pandas as pd
-    recs = records(_extract_all(src), raw_only=raw_only)
-    return pd.DataFrame({"index": [r["_index"] for r in recs],
-                         "value": [r["value"] for r in recs],
-                         "dataset": [r["dataset"] for r in recs]})
+    c = records(_sheets(src), raw_only=raw_only).cols
+    return pd.DataFrame({"index": c["_index"], "value": c["value"], "dataset": c["dataset"]})
 
 
 def tables(src, raw_only: bool = True, source: bool = False) -> dict:
@@ -113,4 +117,4 @@ def tables(src, raw_only: bool = True, source: bool = False) -> dict:
     used) and `value`. source=True adds file, sheet, address.
 
     Returns {dataset number: DataFrame}."""
-    return _tables(records(_extract_all(src), raw_only=raw_only), source=source)
+    return _tables(records(_sheets(src), raw_only=raw_only, keep_index=False), source=source)

@@ -146,31 +146,54 @@ class Datasets:
 
 
 # --------------------------------------------------------------------------- #
-def records(cells: list[dict], raw_only: bool = True) -> list[dict]:
-    """cells from extract.extract() -> one record per value.
+# Records
+# --------------------------------------------------------------------------- #
+COLUMNS = ["file", "sheet", "table", "address", "row", "col", "value", "dataset", "context",
+           *(f"axis{j + 1}" for j in range(MAX_AXES)), "other", "dropped", "is_formula", "dup"]
 
-    Record keys: file, sheet, table, address, row, col, value, dataset, context, axis1..axis6, other,
-    dropped, labels, is_formula, dup. Every label of a cell is in exactly one of context /
-    axis1..6 / other / dropped.
-    Internal keys (start with '_'): _index (set of the cell's labels), _context and _axes
-    ({label key: (text, source cell)}, used by relational.py to name the columns)."""
-    # 1. clean labels; display each key with its most used spelling
-    spell = defaultdict(Counter)
-    for c in cells:
-        for lb, via in zip(c["labels"], c["via"]):
-            key, reason = clean_key(lb.text, lb.date_value, via == "header")
-            if reason is None:
-                spell[key][" ".join(lb.text.split())] += 1
-    display = {k: s.most_common(1)[0][0] for k, s in spell.items()}
 
-    # 2. raw data only; cells without any kept label cannot be placed and are left out
+class Records:
+    """Records in columns: one list per column, record i is position i in every list.
+
+    cols   COLUMNS, plus `_index` (frozenset of each record's labels, when kept) and `_tid`
+           (the record's table: a position in meta)
+    meta   one entry per table, for relational.py to name the columns:
+             key      (file, sheet, table)
+             context  {label key: (text, source cell)} for the table's context labels
+             origins  {axis j: source cells of the labels on that axis (dict keys, first seen first)}
+             axes     axes j with a label on at least one record"""
+
+    def __init__(self, cols: dict, meta: list):
+        self.cols, self.meta = cols, meta
+
+    def __len__(self):
+        return len(self.cols["value"])
+
+
+def _show(keys, own):
+    """A record shows its cell's own spelling of each label."""
+    return " · ".join(sorted({x for k in keys for x in own[k]}, key=str.casefold)) or None
+
+
+class _Table:
+    """One table after steps 1-3, kept compact: its axes, its table metadata and one entry per
+    value cell in column lists (the cell dicts and their Label objects are not kept)."""
+    __slots__ = ("key", "n", "constants", "main", "cols", "ax", "context", "origins")
+
+
+def _sheet_tables(cells: list[dict], raw_only: bool, pool: dict, keep_index: bool) -> list[_Table]:
+    """Steps 1-3 on one sheet's cells: clean labels, raw data only, axes per table.
+    pool: shared strings, so a label's text is stored once however many records show it."""
+    share = lambda x: pool.setdefault(x, x) if x is not None else None
+
+    # 1. clean labels, 2. raw data only; cells without any kept label cannot be placed and are left out
     by_table = defaultdict(list)
     for c in cells:
         if c["value_type"] in ("error", "none") or (raw_only and not is_raw(c["formula"])):
             continue
         keys, own, dropped, origin = set(), defaultdict(set), [], {}
         for lb, via in zip(c["labels"], c["via"]):
-            text = " ".join(lb.text.split())
+            text = share(" ".join(lb.text.split()))
             key, reason = clean_key(lb.text, lb.date_value, via == "header")
             if reason is None:
                 keys.add(key)
@@ -181,53 +204,117 @@ def records(cells: list[dict], raw_only: bool = True) -> list[dict]:
         if keys:
             by_table[(c["file"], c["sheet"], c["table"])].append((c, frozenset(keys), own, dropped, origin))
 
-    # 3. axes per table, 4. datasets; largest tables first so a dataset's first table is its fullest
-    ds, info = Datasets(), {}
-    for t in sorted(by_table, key=lambda t: (-len(by_table[t]), t)):
-        constants, axes = table_axes([x[1] for x in by_table[t]])
-        main, rest = axes[:MAX_AXES], axes[MAX_AXES:]
-        d = ds.match(main, constants)
-        m = Datasets.mapping(main, ds.rep[d]) if main else {}
-        info[t] = (d, constants, main, rest, m)
-
-    def show(keys, own):
-        """A record shows its cell's own spelling of each label."""
-        return " · ".join(sorted({x for k in keys for x in (own.get(k) or {display.get(k, k)})}, key=str.casefold)) or None
-
+    # 3. axes per table
     out = []
-    for t, (d, constants, main, rest, m) in info.items():
+    for t, items in by_table.items():
+        constants, axes = table_axes([x[1] for x in items])
+        main, rest = axes[:MAX_AXES], axes[MAX_AXES:]
         rest_keys = set().union(*rest) if rest else set()
-        for c, keys, own, dropped, origin in by_table[t]:
-            rec = {"file": c["file"], "sheet": c["sheet"], "table": c["table"], "address": c["address"],
-                   "row": c["row"], "col": c["col"], "value": c["value"], "dataset": d, "context": show(constants & keys, own)}
-            for j in range(MAX_AXES):
-                rec[f"axis{j + 1}"] = None
+        items.sort(key=lambda x: (x[0]["row"], x[0]["col"]))    # sheet order: the metadata below
+        cols = {k: [] for k in ("address", "row", "col", "value", "is_formula", "context", "other", "dropped")}
+        if keep_index:
+            cols["_index"] = []
+        ax = [[] for _ in main]                                  # label on each axis, by the table's own axis order
+        context, origins = {}, [{} for _ in main]               # origins: source cells, first seen first
+        first = {}                                               # axis -> (first record with it, axis)
+        for q, (c, keys, own, dropped, origin) in enumerate(items):
+            ctx = constants & keys
+            cols["address"].append(c["address"])
+            cols["row"].append(c["row"])
+            cols["col"].append(c["col"])
+            cols["value"].append(c["value"])
+            cols["is_formula"].append(c["formula"] is not None)
+            cols["context"].append(share(_show(ctx, own)))
             for i, a in enumerate(main):
-                hit = keys & a
-                if hit:
-                    rec[f"axis{m[i] + 1}"] = show(hit, own)
-            rec["other"] = show(keys & rest_keys, own)
-            rec["dropped"] = " · ".join(sorted(dropped, key=str.casefold)) or None
-            rec["labels"] = " · ".join(sorted({x for v in own.values() for x in v}, key=str.casefold))
-            rec["_index"] = frozenset(x for v in own.values() for x in v)
-            rec["is_formula"] = c["formula"] is not None
-            # for tables(): each label's text and source cell, by part of the record
-            lab = lambda ks: {k: (show({k}, own), origin.get(k)) for k in ks}
-            rec["_context"] = lab(constants & keys)
-            rec["_axes"] = {m[i]: lab(keys & a) for i, a in enumerate(main) if keys & a}
-            out.append(rec)
+                h = keys & a
+                ax[i].append(share(_show(h, own)) if h else None)
+                if h and i not in first:
+                    first[i] = (q, i)
+                for k in h:
+                    origins[i].setdefault(origin.get(k))
+            cols["other"].append(share(_show(keys & rest_keys, own)))
+            cols["dropped"].append(share(" · ".join(sorted(dropped, key=str.casefold)) or None))
+            if keep_index:
+                cols["_index"].append(frozenset(x for v in own.values() for x in v))
+            for k in ctx:                                        # the table's context labels, with the
+                context[k] = (_show({k}, own), origin.get(k))    # spelling of the last cell in sheet order
+        tb = _Table()
+        tb.key, tb.n, tb.constants, tb.main = t, len(items), constants, main
+        tb.cols, tb.ax, tb.context = cols, ax, context
+        tb.origins = {i: origins[i] for i in sorted(first, key=first.get)}   # axes in the order records show them
+        out.append(tb)
+    return out
+
+
+def records(cells, raw_only: bool = True, keep_index: bool = True) -> Records:
+    """cells from extract -> one record per value, as Records (columns + per-table metadata).
+
+    cells:      an iterable of sheets, each a list of cell dicts (extract.extract_sheets), or one flat
+                list of cell dicts (extract.extract). A table must not be split across sheets. Each
+                sheet is reduced to its tables' axes and compact columns before the next one is read;
+                datasets are matched once all sheets are in.
+    keep_index: keep `_index`, the set of each record's labels (for raw() and read()'s `index`).
+
+    Every label of a cell is in exactly one of context / axis1..6 / other / dropped.
+    Records come in sheet order, row by row."""
+    import numpy as np
+    import pandas as pd
+
+    if isinstance(cells, list) and (not cells or isinstance(cells[0], dict)):
+        cells = [cells]
+    pool, tables = {}, []
+    for sheet in cells:
+        tables += _sheet_tables(sheet, raw_only, pool, keep_index)
+        del sheet
+    pool.clear()
+
+    # 4. datasets; largest tables first so a dataset's first table is its fullest
+    names = COLUMNS[:-1] + ["_tid"] + (["_index"] if keep_index else [])
+    out = {k: [] for k in names}
+    meta, ds, size = [], Datasets(), Counter()
+    tables.sort(key=lambda tb: (-tb.n, tb.key))
+    for tid, tb in enumerate(tables):
+        d = ds.match(tb.main, tb.constants)
+        m = Datasets.mapping(tb.main, ds.rep[d]) if tb.main else {}
+        n = tb.n
+        f, sh, tref = tb.key
+        out["file"] += [f] * n
+        out["sheet"] += [sh] * n
+        out["table"] += [tref] * n
+        out["dataset"] += [d] * n
+        out["_tid"] += [tid] * n
+        for k, v in tb.cols.items():
+            out[k] += v
+        local = {j: i for i, j in m.items()}
+        for j in range(MAX_AXES):
+            out[f"axis{j + 1}"] += tb.ax[local[j]] if j in local else [None] * n
+        meta.append({"key": tb.key, "context": tb.context,
+                     "origins": {m[i]: o for i, o in tb.origins.items()},
+                     "axes": {m[i] for i, a in enumerate(tb.ax) if any(x is not None for x in a)}})
+        size[d] += n
+        tables[tid] = None                                       # free the table's columns
+    if not out["value"]:
+        return Records({k: [] for k in COLUMNS + names[len(COLUMNS) - 1:]}, meta)
 
     # records of a dataset with the same full key: > 1 means a dimension is missing
-    axis_cols = ["context"] + [f"axis{j + 1}" for j in range(MAX_AXES)] + ["other"]
-    full = lambda r: (r["dataset"], r["file"], r["sheet"], *(r[k] for k in axis_cols))
-    n = Counter(full(r) for r in out)
-    for r in out:
-        r["dup"] = n[full(r)]
+    code = None
+    for k in ["dataset", "file", "sheet", "context", *(f"axis{j + 1}" for j in range(MAX_AXES)), "other"]:
+        c, u = pd.factorize(np.array(out[k], dtype=object))
+        c = c.astype(np.int64) + 1                               # None -> 0
+        code = c if code is None else pd.factorize(code * (len(u) + 1) + c)[0]
+    out["dup"] = np.bincount(code)[code].tolist()
+    del code
 
     # number datasets 1, 2, ... by size
-    size = Counter(r["dataset"] for r in out)
     new_id = {d: i for i, (d, _) in enumerate(size.most_common(), 1)}
-    for r in out:
-        r["dataset"] = new_id[r["dataset"]]
-    out.sort(key=lambda r: (r["file"], r["sheet"], r["row"], r["col"]))      # sheet order, row by row
-    return out
+    out["dataset"] = [new_id[d] for d in out["dataset"]]
+
+    # sheet order, row by row
+    fc = pd.factorize(np.array(out["file"], dtype=object), sort=True)[0]
+    sc = pd.factorize(np.array(out["sheet"], dtype=object), sort=True)[0]
+    perm = np.lexsort((np.array(out["col"]), np.array(out["row"]), sc, fc)).tolist()
+    del fc, sc
+    for k in out:
+        v = out[k]
+        out[k] = [v[i] for i in perm]
+    return Records(out, meta)

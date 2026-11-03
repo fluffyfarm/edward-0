@@ -20,8 +20,11 @@ from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, time as dtime
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl import load_workbook
+from openpyxl.cell.read_only import ReadOnlyCell
+from openpyxl.styles.numbers import is_date_format
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet._reader import WorkSheetParser
 
 # --------------------------------------------------------------------------- #
 # Values and labels
@@ -127,36 +130,40 @@ def cell_value(v, has_formula: bool):
 # One worksheet as a grid
 # --------------------------------------------------------------------------- #
 class Grid:
-    """Cached values, formulas, number formats and merged ranges of one worksheet."""
+    """Cached values, formulas, number formats and merged ranges of one worksheet.
+    Built by grid_xlsx() (a sheet read in read-only mode) or grid_csv()."""
 
-    def __init__(self, ws_f, ws_v):
+    def __init__(self):
         self.value: dict[tuple[int, int], object] = {}
         self.formula: dict[tuple[int, int], str] = {}
         self.fmt: dict[tuple[int, int], str] = {}
-        for row in ws_f.iter_rows():
-            for c in row:
-                v = c.value
-                if v is None:
-                    continue
-                rc = (c.row, c.column)
-                if isinstance(v, str) and v.startswith("="):
-                    self.formula[rc] = v
-                elif hasattr(v, "text") and not isinstance(v, str):          # ArrayFormula / DataTableFormula
-                    self.formula[rc] = getattr(v, "text", None) or str(v)
-                else:
-                    self.value[rc] = v
-                if c.is_date:
-                    self.fmt[rc] = c.number_format
-        for rc in self.formula:                                              # cached results
-            cv = ws_v.cell(*rc)
-            self.value[rc] = cv.value
-            if cv.is_date:
-                self.fmt[rc] = ws_f.cell(*rc).number_format
         self.anchor: dict[tuple[int, int], tuple[int, int]] = {}
-        for mr in ws_f.merged_cells.ranges:
-            top = (mr.min_row, mr.min_col)
-            for r in range(mr.min_row, mr.max_row + 1):
-                for c in range(mr.min_col, mr.max_col + 1):
+
+    def put(self, rc, v, is_date: bool = False, number_format: str | None = None):
+        """One cell of the sheet with formulas (as stored, not calculated)."""
+        if v is None:
+            return
+        if isinstance(v, str) and v.startswith("="):
+            self.formula[rc] = v
+        elif hasattr(v, "text") and not isinstance(v, str):              # ArrayFormula / DataTableFormula
+            self.formula[rc] = getattr(v, "text", None) or str(v)
+        else:
+            self.value[rc] = v
+        if is_date:
+            self.fmt[rc] = number_format
+
+    def merge(self, refs):
+        """Merged ranges ('A1:C2'). As openpyxl does on a normal load, only the top-left cell of a
+        range keeps its content; the cells it covers are emptied."""
+        for ref in refs:
+            c0, r0, c1, r1 = range_boundaries(ref)
+            top = (r0, c0)
+            for r in range(r0, r1 + 1):
+                for c in range(c0, c1 + 1):
+                    if (r, c) != top:
+                        self.value.pop((r, c), None)
+                        self.formula.pop((r, c), None)
+                        self.fmt.pop((r, c), None)
                     self.anchor[(r, c)] = top
 
     def raw(self, r, c):
@@ -552,15 +559,66 @@ def csv_value(s: str):
     return int(x) if x.is_integer() and not pct else x
 
 
-def csv_workbook(path: str) -> Workbook:
-    """A CSV file as a one-sheet workbook (sheet named after the file)."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(os.path.basename(path))[0])[:31]
+def grid_csv(path: str) -> Grid:
+    """A CSV file as a Grid, cell by cell as Excel would hold it (a text starting with '=' is a
+    formula, and is also its own cached value)."""
+    g = Grid()
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
-        for row in csv.reader(f):
-            ws.append([csv_value(v) for v in row])
-    return wb
+        for r, row in enumerate(csv.reader(f), 1):
+            for c, field in enumerate(row, 1):
+                v = csv_value(field)
+                if isinstance(v, str):
+                    v = v[:32767]                                        # Excel's cell limit
+                g.put((r, c), v)
+                if (r, c) in g.formula:
+                    g.value[(r, c)] = v
+    return g
+
+
+def _sheet_rows(ws, merges: list | None = None):
+    """The cells of a read-only worksheet as openpyxl's sheet parser reads them (the same parser a
+    normal load uses): dicts with row, column, value, data_type, style_id. When the rows are done,
+    the sheet's merged ranges (stored after them) are added to `merges`."""
+    wb = ws.parent
+    with ws._get_source() as src:
+        parser = WorkSheetParser(src, ws._shared_strings, data_only=wb.data_only, epoch=wb.epoch,
+                                 date_formats=wb._date_formats, timedelta_formats=wb._timedelta_formats)
+        for _, row in parser.parse():
+            yield from row
+        if merges is not None and parser.merged_cells:
+            merges += [cr.ref for cr in parser.merged_cells.mergeCell]
+
+
+def grid_xlsx(ws_f, ws_v) -> Grid:
+    """One sheet, read in read-only mode: formulas from ws_f, their cached results from ws_v
+    (the same sheet of the workbook opened with data_only=True)."""
+    styles = {}
+
+    def style(ws, sid):                                  # number format and is-date, per style
+        if sid not in styles:
+            nf = ReadOnlyCell(ws, 1, 1, None, "n", sid).number_format
+            styles[sid] = (nf, is_date_format(nf))
+        return styles[sid]
+
+    def is_date(ws, cell):                               # as openpyxl's Cell.is_date
+        t = cell["data_type"]
+        return t == "d" or (t == "n" and style(ws, cell["style_id"])[1])
+
+    g, merges = Grid(), []
+    for cell in _sheet_rows(ws_f, merges):
+        d = is_date(ws_f, cell)
+        g.put((cell["row"], cell["column"]), cell["value"], d, style(ws_f, cell["style_id"])[0] if d else None)
+    g.merge(merges)
+    if g.formula:                                        # cached results
+        for rc in g.formula:
+            g.value[rc] = None
+        for cell in _sheet_rows(ws_v):
+            rc = (cell["row"], cell["column"])
+            if rc in g.formula:
+                g.value[rc] = cell["value"]
+                if is_date(ws_v, cell):
+                    g.fmt[rc] = style(ws_v, cell["style_id"])[0]
+    return g
 
 
 def extract(path: str) -> list[dict]:
@@ -569,95 +627,107 @@ def extract(path: str) -> list[dict]:
     Returns dicts: file, sheet, table, address, row, col, value_type, value, formula,
     labels (list of Label, unordered in meaning), via (where each label came from:
     header | title | layout; same order as labels)."""
+    return [c for sheet in extract_sheets(path) for c in sheet]
+
+
+def extract_sheets(path: str):
+    """Like extract(), one sheet at a time: yields the value cells of each sheet as a list.
+    Only one sheet's grid and cells are held at a time."""
     name = os.path.basename(path)
     if path.lower().endswith(".csv"):
-        wb_f = wb_v = csv_workbook(path)
-    else:
-        wb_f = load_workbook(path, data_only=False)
-        wb_v = load_workbook(path, data_only=True)
-    out = []
-    for ws in wb_f.worksheets:
-        g = Grid(ws, wb_v[ws.title])
-        layout = Layout(g)
-
-        # tables, and label-only blocks just above them (captions)
-        parts = {}
-        for region in find_regions(g.occupied()):
-            for b in split_stacked(g, region):
-                parts[b] = region
-        tables, captions = [], []
-        for box in parts:
-            t = analyse(g, box)
-            if t is not None:
-                first = tables[-1] if tables and tables[-1].region == parts[box] else None
-                t.region = parts[box]
-                if first is not None and len(first.titles) > len(t.titles):
-                    # stacked blocks: the first block's extra top title rows head them all
-                    shared = first.titles[:len(first.titles) - len(t.titles)]
-                    t.title_labels = [lb for tr in shared for a in _anchors(g, tr, box[1], box[3])[:1]
-                                      if (lb := g.label_at(*a))] + t.title_labels
-                tables.append(t)
-            elif all(is_label(g.lab(r, c)) for r in range(box[0], box[2] + 1)
-                     for c in range(box[1], box[3] + 1) if g.has_content(r, c)):
-                captions.append(box)
-        layout.boxes = [t.box for t in tables]
-        for t in tables:
-            r0, c0, r1, c1 = t.box
-            for cb in captions:
-                if 0 < r0 - cb[2] <= 3 and cb[1] <= c1 and cb[3] >= c0:
-                    t.title_labels = [lb for r in range(cb[0], cb[2] + 1) for a in _anchors(g, r, cb[1], cb[3])
-                                      if (lb := g.label_at(*a))] + t.title_labels
-
-        def own_header(t):
-            """The table's first row is a header row, or puts a label above a column of numbers."""
-            r0, c0, r1, c1 = t.box
-            h = t.header_rows[0]
-            if h in layout.headers(c0, c1)[0]:
-                return True
-            for c in range(c0, c1 + 1):
-                if is_label(g.lab(h, c)) and g.anchor.get((h, c), (h, c)) == (h, c):
-                    body = [g.numeric_like(r, c) for r in range(h + 1, r1 + 1) if g.has_content(r, c)]
-                    if body and sum(body) / len(body) >= 0.8:
-                        return True
-            return False
-
-        for t in tables:
-            box = t.box
-            # a table with its own header never takes header rows from above the nearest table
-            # above it; a block without its own header shares that table's header, nothing higher
-            blockers = [o.box for o in tables if o is not t and o.box[2] < box[0]
-                        and o.box[1] <= box[3] and o.box[3] >= box[1]
-                        and o.header_rows[0] in layout.headers(o.box[1], o.box[3])[0]]
-            own = own_header(t)
-            floors: dict[int, int] = {}
-
-            def floor(c):
-                if c not in floors:
-                    near = max((b for b in blockers if b[1] <= c <= b[3]), key=lambda b: b[2], default=None)
-                    floors[c] = 0 if near is None else near[2] if own else near[0] - 1
-                return floors[c]
-
-            c0, c1 = box[1], box[3]
-            for r, c, header in table_cells(g, t):
-                v = cell_value(g.raw(r, c), (r, c) in g.formula)
-                if v is None:
-                    continue
-                labels, via, seen = [], [], set()
-                head_end = min(r - 1, t.col_header_rows.get(c, t.header_rows)[-1])
-                for src, lbs in (("header", header), ("title", t.title_labels),
-                                 ("layout", layout.labels(r, c, c0, c1, box[0], floor(c), head_end,
-                                                          left=not t.keyed))):
-                    for lb in lbs:
-                        if lb.key() not in seen:              # first source wins: header > title > layout
-                            seen.add(lb.key())
-                            labels.append(lb)
-                            via.append(src)
-                out.append({"file": name, "sheet": ws.title, "table": t.ref,
-                            "address": f"{get_column_letter(c)}{r}", "row": r, "col": c,
-                            "value_type": v[0], "value": v[1], "formula": g.formula.get((r, c)),
-                            "via": via,
-                            "labels": labels})
-    if wb_f is not wb_v:
+        title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(name)[0])[:31]
+        yield _sheet_cells(name, title, grid_csv(path))
+        return
+    wb_f = load_workbook(path, read_only=True, data_only=False)     # read-only: one sheet at a time
+    wb_v = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in wb_f.worksheets:
+            yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title]))
+    finally:
         wb_v.close()
-    wb_f.close()
+        wb_f.close()
+
+
+def _sheet_cells(name: str, sheet: str, g: Grid) -> list[dict]:
+    """The value cells of one worksheet with their labels."""
+    out = []
+    layout = Layout(g)
+
+    # tables, and label-only blocks just above them (captions)
+    parts = {}
+    for region in find_regions(g.occupied()):
+        for b in split_stacked(g, region):
+            parts[b] = region
+    tables, captions = [], []
+    for box in parts:
+        t = analyse(g, box)
+        if t is not None:
+            first = tables[-1] if tables and tables[-1].region == parts[box] else None
+            t.region = parts[box]
+            if first is not None and len(first.titles) > len(t.titles):
+                # stacked blocks: the first block's extra top title rows head them all
+                shared = first.titles[:len(first.titles) - len(t.titles)]
+                t.title_labels = [lb for tr in shared for a in _anchors(g, tr, box[1], box[3])[:1]
+                                  if (lb := g.label_at(*a))] + t.title_labels
+            tables.append(t)
+        elif all(is_label(g.lab(r, c)) for r in range(box[0], box[2] + 1)
+                 for c in range(box[1], box[3] + 1) if g.has_content(r, c)):
+            captions.append(box)
+    layout.boxes = [t.box for t in tables]
+    for t in tables:
+        r0, c0, r1, c1 = t.box
+        for cb in captions:
+            if 0 < r0 - cb[2] <= 3 and cb[1] <= c1 and cb[3] >= c0:
+                t.title_labels = [lb for r in range(cb[0], cb[2] + 1) for a in _anchors(g, r, cb[1], cb[3])
+                                  if (lb := g.label_at(*a))] + t.title_labels
+
+    def own_header(t):
+        """The table's first row is a header row, or puts a label above a column of numbers."""
+        r0, c0, r1, c1 = t.box
+        h = t.header_rows[0]
+        if h in layout.headers(c0, c1)[0]:
+            return True
+        for c in range(c0, c1 + 1):
+            if is_label(g.lab(h, c)) and g.anchor.get((h, c), (h, c)) == (h, c):
+                body = [g.numeric_like(r, c) for r in range(h + 1, r1 + 1) if g.has_content(r, c)]
+                if body and sum(body) / len(body) >= 0.8:
+                    return True
+        return False
+
+    for t in tables:
+        box = t.box
+        # a table with its own header never takes header rows from above the nearest table
+        # above it; a block without its own header shares that table's header, nothing higher
+        blockers = [o.box for o in tables if o is not t and o.box[2] < box[0]
+                    and o.box[1] <= box[3] and o.box[3] >= box[1]
+                    and o.header_rows[0] in layout.headers(o.box[1], o.box[3])[0]]
+        own = own_header(t)
+        floors: dict[int, int] = {}
+
+        def floor(c):
+            if c not in floors:
+                near = max((b for b in blockers if b[1] <= c <= b[3]), key=lambda b: b[2], default=None)
+                floors[c] = 0 if near is None else near[2] if own else near[0] - 1
+            return floors[c]
+
+        c0, c1 = box[1], box[3]
+        for r, c, header in table_cells(g, t):
+            v = cell_value(g.raw(r, c), (r, c) in g.formula)
+            if v is None:
+                continue
+            labels, via, seen = [], [], set()
+            head_end = min(r - 1, t.col_header_rows.get(c, t.header_rows)[-1])
+            for src, lbs in (("header", header), ("title", t.title_labels),
+                             ("layout", layout.labels(r, c, c0, c1, box[0], floor(c), head_end,
+                                                      left=not t.keyed))):
+                for lb in lbs:
+                    if lb.key() not in seen:              # first source wins: header > title > layout
+                        seen.add(lb.key())
+                        labels.append(lb)
+                        via.append(src)
+            out.append({"file": name, "sheet": sheet, "table": t.ref,
+                        "address": f"{get_column_letter(c)}{r}", "row": r, "col": c,
+                        "value_type": v[0], "value": v[1], "formula": g.formula.get((r, c)),
+                        "via": via,
+                        "labels": labels})
     return out
