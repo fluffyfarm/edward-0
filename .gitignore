@@ -2,3 +2,5 @@
 .DS_Store
 /review_data
 .venv
+/data
+*.ipynb
