@@ -621,28 +621,37 @@ def grid_xlsx(ws_f, ws_v) -> Grid:
     return g
 
 
-def extract(path: str) -> list[dict]:
+def extract(path: str, sheets=None) -> list[dict]:
     """Every value cell of a workbook (.xlsx / .xlsm / .csv) with its labels.
+    sheets: a sheet name or a list of them to read only those (default: every sheet).
 
     Returns dicts: file, sheet, table, address, row, col, value_type, value, formula,
     labels (list of Label, unordered in meaning), via (where each label came from:
     header | title | layout; same order as labels)."""
-    return [c for sheet in extract_sheets(path) for c in sheet]
+    return [c for sheet in extract_sheets(path, sheets) for c in sheet]
 
 
-def extract_sheets(path: str):
+def extract_sheets(path: str, sheets=None, names: list | None = None):
     """Like extract(), one sheet at a time: yields the value cells of each sheet as a list.
-    Only one sheet's grid and cells are held at a time."""
+    Only one sheet's grid and cells are held at a time; sheets not asked for are not read.
+    names: a list to receive the names of all sheets in the file."""
+    want = {sheets} if isinstance(sheets, str) else set(sheets) if sheets is not None else None
     name = os.path.basename(path)
     if path.lower().endswith(".csv"):
         title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(name)[0])[:31]
-        yield _sheet_cells(name, title, grid_csv(path))
+        if names is not None:
+            names.append(title)
+        if want is None or title in want:
+            yield _sheet_cells(name, title, grid_csv(path))
         return
     wb_f = load_workbook(path, read_only=True, data_only=False)     # read-only: one sheet at a time
     wb_v = load_workbook(path, read_only=True, data_only=True)
     try:
+        if names is not None:
+            names += [ws.title for ws in wb_f.worksheets]
         for ws in wb_f.worksheets:
-            yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title]))
+            if want is None or ws.title in want:
+                yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title]))
     finally:
         wb_v.close()
         wb_f.close()

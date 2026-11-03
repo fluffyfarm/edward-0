@@ -14,6 +14,7 @@ df = cleaner.read("book.xlsx")        # a file, a folder, or a list of them
 df[["sheet", "address", "value", "context", "axis1", "axis2"]]
 
 tables = cleaner.tables("book.xlsx")  # {dataset: long relational table, named columns}
+tables = cleaner.tables("book.xlsx", sheets="Sales")   # only some sheets: a name or a list
 tables[1]
 #    Year  Term    Mark         Mark.2  value
 #    1991  Winter  Assignments  Ass1       85
