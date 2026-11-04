@@ -95,8 +95,9 @@ def tables(recs, source: bool = False) -> dict:
         axes = [j for j in range(MAX_AXES) if any(j in meta[t]["axes"] for t, _ in tbls)]
         axes.sort(key=lambda j: ({"row": 0, "col": 1}[shapes[j][0]], shapes[j][1]) if j in shapes else (2, j))
 
-        # column names, unique: a repeated name gets .2, .3 ...
-        cols, seen = {}, Counter()
+        # column names, unique: a repeated name gets .2, .3 ..., and so does a name the output
+        # already uses (an axis headed 'value' becomes 'value.2', next to the values in 'value')
+        cols, seen = {}, Counter(["context", "other", "value"] + (["file", "sheet", "address"] if source else []))
         for j in axes:
             n = votes[j].most_common(1)[0][0] if votes[j] else f"axis{j + 1}"
             seen[n] += 1
