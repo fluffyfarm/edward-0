@@ -17,6 +17,7 @@ import csv
 import os
 import re
 from array import array
+from decimal import Decimal, InvalidOperation
 from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, time as dtime
@@ -639,34 +640,44 @@ class SheetCells:
 # --------------------------------------------------------------------------- #
 # Files
 # --------------------------------------------------------------------------- #
-_CSV_NUM = re.compile(r"^\(?-?[\d,]*\.?\d+\)?%?$")
+_CSV_NUM = re.compile(r"^\(?-?[\d,]*\.?\d+%?\)?%?$")
 
 
-def csv_value(s: str):
-    """A CSV field as Excel would show it: '105,299' -> 105299, '(491)' -> -491, '12%' -> 0.12."""
+def csv_value(s: str, text: bool = False):
+    """A CSV field as Excel would show it: '105,299' -> 105299, '(491)' -> -491, '12%' -> 0.12,
+    '(5%)' -> -0.05.
+    Whole numbers are read exactly, never through a float ('9007199254740993' stays that integer);
+    text=True keeps the field as written (an ID '00123' keeps its zeros)."""
     t = s.strip()
-    if not t or not _CSV_NUM.match(t):
-        return t or None
-    neg = t.startswith("(") and t.endswith(")")
-    pct = t.endswith("%")
-    t = t.strip("()%").replace(",", "")
+    if not t:
+        return None
+    if text or not _CSV_NUM.match(t) or t.count("%") > 1 or t.startswith("(") != t.rstrip("%").endswith(")"):
+        return t                                         # not a number (or brackets that do not pair up)
+    neg = t.startswith("(")                              # accounting negative: (491), (5%), (5)%
+    pct = "%" in t
     try:
-        x = float(t)
-    except ValueError:
-        return s.strip()
+        x = Decimal(t.strip("()%").replace(",", ""))
+    except InvalidOperation:
+        return t
     x = -x if neg else x
-    x = x / 100 if pct else x
-    return int(x) if x.is_integer() and not pct else x
+    if pct:
+        return float(x / 100)
+    return int(x) if x == x.to_integral_value() else float(x)
 
 
-def grid_csv(path: str) -> Grid:
+def grid_csv(path: str, text_columns=None) -> Grid:
     """A CSV file as a Grid, cell by cell as Excel would hold it (a text starting with '=' is a
-    formula, and is also its own cached value)."""
+    formula, and is also its own cached value).
+    text_columns: columns kept as written, named by their header (first row) or letter ('A')."""
     g = Grid()
+    want, as_text = set(text_columns or ()), set()
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         for r, row in enumerate(csv.reader(f), 1):
+            if r == 1 and want:
+                as_text = {c for c, field in enumerate(row, 1)
+                           if field.strip() in want or get_column_letter(c) in want}
             for c, field in enumerate(row, 1):
-                v = csv_value(field)
+                v = csv_value(field, c in as_text)
                 if isinstance(v, str):
                     v = v[:32767]                                        # Excel's cell limit
                 g.put((r, c), v)
@@ -721,17 +732,18 @@ def grid_xlsx(ws_f, ws_v) -> Grid:
     return g
 
 
-def extract(path: str, sheets=None) -> list[dict]:
+def extract(path: str, sheets=None, text_columns=None) -> list[dict]:
     """Every value cell of a workbook (.xlsx / .xlsm / .csv) with its labels.
     sheets: a sheet name or a list of them to read only those (default: every sheet).
+    text_columns: CSV columns kept as text, by header or letter (see grid_csv).
 
     Returns dicts: file, sheet, table, address, row, col, value_type, value, formula,
     labels (list of Label, unordered in meaning), via (where each label came from:
     header | title | layout; same order as labels)."""
-    return [c for sheet in extract_sheets(path, sheets) for c in sheet.dicts()]
+    return [c for sheet in extract_sheets(path, sheets, text_columns=text_columns) for c in sheet.dicts()]
 
 
-def extract_sheets(path: str, sheets=None, names: list | None = None):
+def extract_sheets(path: str, sheets=None, names: list | None = None, text_columns=None):
     """Like extract(), one sheet at a time: yields the value cells of each sheet as SheetCells.
     Only one sheet's grid and cells are held at a time; sheets not asked for are not read.
     names: a list to receive the names of all sheets in the file."""
@@ -742,7 +754,7 @@ def extract_sheets(path: str, sheets=None, names: list | None = None):
         if names is not None:
             names.append(title)
         if want is None or title in want:
-            yield _sheet_cells(name, title, grid_csv(path))
+            yield _sheet_cells(name, title, grid_csv(path, text_columns))
         return
     wb_f = load_workbook(path, read_only=True, data_only=False)     # read-only: one sheet at a time
     wb_v = load_workbook(path, read_only=True, data_only=True)

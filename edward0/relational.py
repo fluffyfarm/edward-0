@@ -25,7 +25,10 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
-from .clean import MAX_AXES
+from .clean import MAX_AXES, exact_values
+
+RESERVED = ["context", "other", "value"]           # columns of every table
+SOURCE_COLUMNS = ["file", "sheet", "address"]      # columns added by source=True
 
 
 def _shape(origins):
@@ -95,13 +98,18 @@ def tables(recs, source: bool = False) -> dict:
         axes = [j for j in range(MAX_AXES) if any(j in meta[t]["axes"] for t, _ in tbls)]
         axes.sort(key=lambda j: ({"row": 0, "col": 1}[shapes[j][0]], shapes[j][1]) if j in shapes else (2, j))
 
-        # column names, unique: a repeated name gets .2, .3 ..., and so does a name the output
-        # already uses (an axis headed 'value' becomes 'value.2', next to the values in 'value')
-        cols, seen = {}, Counter(["context", "other", "value"] + (["file", "sheet", "address"] if source else []))
+        # column names, unique: a name already taken gets .2, .3 ... (the first free one). Taken are
+        # the output's own columns ('value' ...) and the names given before: an axis headed 'value'
+        # becomes 'value.2', and a header that literally reads 'value.2' then becomes 'value.2.2'
+        cols, used = {}, set(RESERVED + (SOURCE_COLUMNS if source else []))
         for j in axes:
-            n = votes[j].most_common(1)[0][0] if votes[j] else f"axis{j + 1}"
-            seen[n] += 1
-            cols[j] = n if seen[n] == 1 else f"{n}.{seen[n]}"
+            base = votes[j].most_common(1)[0][0] if votes[j] else f"axis{j + 1}"
+            name, k = base, 1
+            while name in used:
+                k += 1
+                name = f"{base}.{k}"
+            used.add(name)
+            cols[j] = name
 
         il = idx.tolist()
         pick = lambda k: [C[k][i] for i in il]
@@ -114,7 +122,7 @@ def tables(recs, source: bool = False) -> dict:
             ctx_text[t] = " · ".join(sorted(ctx, key=str.casefold)) or None
         data["context"] = [ctx_text[t] for t in tids.tolist()]
         data["other"] = pick("other")
-        data["value"] = pick("value")
+        data["value"] = exact_values(pick("value"))
         if source:
             data["file"], data["sheet"], data["address"] = pick("file"), pick("sheet"), pick("address")
 

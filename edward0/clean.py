@@ -28,6 +28,16 @@ ERROR_LABELS = {"#ref!", "#value!", "#div/0!", "#n/a", "#name?", "#num!", "#null
 _CONSTANT = re.compile(r"=[\d\s.+\-*/^()%,eE]*")
 
 
+def exact_values(values):
+    """A value column for pandas that keeps integers exact: numbers would become float64, which
+    rounds integers beyond 2**53, so such a column keeps the Python values (object) instead."""
+    import pandas as pd
+    col = pd.Series(values)
+    if col.dtype.kind == "f" and any(type(v) is int and not -2 ** 53 <= v <= 2 ** 53 for v in values):
+        col = pd.Series(values, dtype=object)
+    return col
+
+
 def is_raw(formula) -> bool:
     """A typed value, or a formula that is only arithmetic on numbers (no cells, names or functions)."""
     return formula is None or bool(_CONSTANT.fullmatch(formula.strip()))

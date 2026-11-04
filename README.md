@@ -15,6 +15,7 @@ df[["sheet", "address", "value", "context", "axis1", "axis2"]]
 
 tables = cleaner.tables("book.xlsx")  # {dataset: long relational table, named columns}
 tables = cleaner.tables("book.xlsx", sheets="Sales")   # only some sheets: a name or a list
+df = cleaner.read("ids.csv", text_columns=["Customer ID"])   # CSV: keep a column as text ("00123")
 tables[1]
 #    Year  Term    Mark         Mark.2  value
 #    1991  Winter  Assignments  Ass1       85
@@ -47,3 +48,9 @@ gets `.2`; no name found: `axis1` …), then `context` (only when it differs bet
 
 By default cells calculated from other cells are left out (`read(..., raw_only=False)`
 keeps them). See `ALGORITHM.md` for how it works.
+
+## Tests
+
+```bash
+uv run --group dev pytest        # or: pip install pytest && pytest
+```
