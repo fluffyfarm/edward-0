@@ -16,6 +16,7 @@ df[["sheet", "address", "value", "context", "axis1", "axis2"]]
 tables = cleaner.tables("book.xlsx")  # {dataset: long relational table, named columns}
 tables = cleaner.tables("book.xlsx", sheets="Sales")   # only some sheets: a name or a list
 df = cleaner.read("ids.csv", text_columns=["Customer ID"])   # CSV: keep a column as text ("00123")
+df = cleaner.read("book.xlsx", visible_only=True)            # leave out hidden rows and columns
 tables[1]
 #    Year  Term    Mark         Mark.2  value
 #    1991  Winter  Assignments  Ass1       85

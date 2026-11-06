@@ -7,6 +7,7 @@ edward0 - spreadsheets to relational records.
     df = cleaner.read("data/2026-10-09")    # every .xlsx / .xlsm / .csv in a folder
     tables = cleaner.tables("book.xlsx", sheets="Sales")   # only some sheets (a name or a list)
     df = cleaner.read("ids.csv", text_columns=["Customer ID"])   # keep a CSV column as text ('00123')
+    df = cleaner.read("book.xlsx", visible_only=True)   # leave out hidden rows and columns
     tables = cleaner.tables("book.xlsx")    # {dataset: long table with named columns}
     raw = cleaner.raw("book.xlsx")          # index (set of labels), value, dataset
     cells = cleaner.cells("book.xlsx")      # step 1 only: each value cell with its labels
@@ -43,35 +44,39 @@ def _paths(src) -> list[str]:
     return out
 
 
-def _sheets(src, sheets=None, text_columns=None):
+def _sheets(src, sheets=None, text_columns=None, visible_only=False):
     """Every sheet of every file, one at a time (a list of value cells per sheet).
     sheets: a sheet name or a list of them (default: every sheet); a name found in none of the
     files is an error."""
     want = None if sheets is None else [sheets] if isinstance(sheets, str) else list(sheets)
     names = []
     for p in _paths(src):
-        yield from extract_sheets(p, want, names, text_columns)
+        yield from extract_sheets(p, want, names, text_columns, visible_only)
     missing = [s for s in want or [] if s not in names]
     if missing:
         raise ValueError(f"sheet not found: {', '.join(map(repr, missing))}; "
                          f"sheets: {', '.join(map(repr, dict.fromkeys(names)))}")
 
 
-def _extract_all(src, sheets=None, text_columns=None) -> list[dict]:
-    return [c for sheet in _sheets(src, sheets, text_columns) for c in sheet.dicts()]
+def _extract_all(src, sheets=None, text_columns=None, visible_only=False) -> list[dict]:
+    return [c for sheet in _sheets(src, sheets, text_columns, visible_only) for c in sheet.dicts()]
 
 
-def cells(src, sheets=None, text_columns=None):
+def cells(src, sheets=None, text_columns=None, visible_only: bool = False):
     """Every value cell with the labels around it (no cleaning).
 
     src:    a file, a folder, or a list of them.
     sheets: a sheet name or a list of them (default: every sheet).
     text_columns: CSV columns kept as written (e.g. IDs with leading zeros: "00123"), by header
               or letter: text_columns=["Customer ID"] or ["A"]. Excel files keep their own types.
+    visible_only: leave out hidden rows and columns (also filtered-out and collapsed ones), as on
+              screen: tables and headers are found on the visible cells only, which close up (a
+              hidden header row gives no labels; a hidden column does not split a table).
+              Addresses stay those of the sheet. Hidden sheets are still read. Excel files only.
     Columns: file, sheet, table, address, row, col, value_type, value, formula,
     labels (each with where it came from: header, title or layout)."""
     import pandas as pd
-    rows = _extract_all(src, sheets, text_columns)
+    rows = _extract_all(src, sheets, text_columns, visible_only)
     for r in rows:
         r["labels"] = " · ".join(f"{lb.text} ({via})" for lb, via in zip(r["labels"], r.pop("via")))
     df = pd.DataFrame(rows, columns=["file", "sheet", "table", "address", "row", "col",
@@ -81,7 +86,7 @@ def cells(src, sheets=None, text_columns=None):
     return df
 
 
-def read(src, raw_only: bool = True, sheets=None, text_columns=None):
+def read(src, raw_only: bool = True, sheets=None, text_columns=None, visible_only: bool = False):
     """Relational records: one row per value.
 
     src:       a file, a folder, or a list of them (.xlsx / .xlsm / .csv).
@@ -90,6 +95,10 @@ def read(src, raw_only: bool = True, sheets=None, text_columns=None):
                matched among those sheets only.
     text_columns: CSV columns kept as written (e.g. IDs with leading zeros: "00123"), by header
               or letter: text_columns=["Customer ID"] or ["A"]. Excel files keep their own types.
+    visible_only: leave out hidden rows and columns (also filtered-out and collapsed ones), as on
+              screen: tables and headers are found on the visible cells only, which close up (a
+              hidden header row gives no labels; a hidden column does not split a table).
+              Addresses stay those of the sheet. Hidden sheets are still read. Excel files only.
 
     Columns:
       file, sheet, table, address  where the value is (row, col: its row and column numbers;
@@ -105,7 +114,7 @@ def read(src, raw_only: bool = True, sheets=None, text_columns=None):
       dup                          records in the dataset with the same key (1 = unique)
     """
     import pandas as pd
-    c = records(_sheets(src, sheets, text_columns), raw_only=raw_only).cols
+    c = records(_sheets(src, sheets, text_columns, visible_only), raw_only=raw_only).cols
     data = {k: c[k] for k in COLUMNS[:COLUMNS.index("is_formula")]}
     if c["value"]:
         data["value"] = exact_values(c["value"])
@@ -114,7 +123,7 @@ def read(src, raw_only: bool = True, sheets=None, text_columns=None):
     return pd.DataFrame(data)
 
 
-def raw(src, raw_only: bool = True, sheets=None, text_columns=None):
+def raw(src, raw_only: bool = True, sheets=None, text_columns=None, visible_only: bool = False):
     """The simplest form: every value with the set of labels that identify it.
 
     Columns:
@@ -125,14 +134,19 @@ def raw(src, raw_only: bool = True, sheets=None, text_columns=None):
     sheets: a sheet name or a list of them (default: every sheet).
     text_columns: CSV columns kept as written (e.g. IDs with leading zeros: "00123"), by header
               or letter: text_columns=["Customer ID"] or ["A"]. Excel files keep their own types.
+    visible_only: leave out hidden rows and columns (also filtered-out and collapsed ones), as on
+              screen: tables and headers are found on the visible cells only, which close up (a
+              hidden header row gives no labels; a hidden column does not split a table).
+              Addresses stay those of the sheet. Hidden sheets are still read. Excel files only.
     """
     import pandas as pd
-    c = records(_sheets(src, sheets, text_columns), raw_only=raw_only).cols
+    c = records(_sheets(src, sheets, text_columns, visible_only), raw_only=raw_only).cols
     value = exact_values(c["value"]) if c["value"] else c["value"]
     return pd.DataFrame({"index": c["_index"], "value": value, "dataset": c["dataset"]})
 
 
-def tables(src, raw_only: bool = True, source: bool = False, sheets=None, text_columns=None) -> dict:
+def tables(src, raw_only: bool = True, source: bool = False, sheets=None, text_columns=None,
+           visible_only: bool = False) -> dict:
     """One relational table per dataset, long form: one row per value.
 
     Each dimension is a column, named from the sheet ('Year', 'Term', 'Mark'; a lower level of
@@ -142,6 +156,10 @@ def tables(src, raw_only: bool = True, source: bool = False, sheets=None, text_c
     sheets: a sheet name or a list of them (default: every sheet), e.g. sheets="Sales".
     text_columns: CSV columns kept as written (e.g. IDs with leading zeros: "00123"), by header
               or letter: text_columns=["Customer ID"] or ["A"]. Excel files keep their own types.
+    visible_only: leave out hidden rows and columns (also filtered-out and collapsed ones), as on
+              screen: tables and headers are found on the visible cells only, which close up (a
+              hidden header row gives no labels; a hidden column does not split a table).
+              Addresses stay those of the sheet. Hidden sheets are still read. Excel files only.
 
     Returns {dataset number: DataFrame}."""
-    return _tables(records(_sheets(src, sheets, text_columns), raw_only=raw_only, keep_index=False), source=source)
+    return _tables(records(_sheets(src, sheets, text_columns, visible_only), raw_only=raw_only, keep_index=False), source=source)

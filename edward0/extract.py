@@ -18,7 +18,7 @@ import os
 import re
 from array import array
 from decimal import Decimal, InvalidOperation
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import date, datetime, time as dtime
 
@@ -140,6 +140,7 @@ class Grid:
         self.formula: dict[tuple[int, int], str] = {}
         self.fmt: dict[tuple[int, int], str] = {}
         self.anchor: dict[tuple[int, int], tuple[int, int]] = {}
+        self.unmap = None          # after hide(): grid position -> position on the sheet
 
     def put(self, rc, v, is_date: bool = False, number_format: str | None = None):
         """One cell of the sheet with formulas (as stored, not calculated)."""
@@ -167,6 +168,50 @@ class Grid:
                         self.formula.pop((r, c), None)
                         self.fmt.pop((r, c), None)
                     self.anchor[(r, c)] = top
+
+    def hide(self, rows: set, cols: set):
+        """Leave out hidden rows and columns, as on screen: their cells are dropped and the visible
+        cells close up (a hidden column between Jan and Mar does not split the table). Tables and
+        headers are then found on what is visible; self.unmap gives each cell's place on the sheet.
+        A merged range keeps its content when part of it is visible: the content moves to its
+        first visible cell, as Excel shows it."""
+        if not rows and not cols:
+            return
+        hidden = lambda rc: rc[0] in rows or rc[1] in cols
+        ranges = defaultdict(list)
+        for rc, top in self.anchor.items():
+            ranges[top].append(rc)
+        anchor = {}
+        for top, members in ranges.items():
+            shown = sorted(rc for rc in members if not hidden(rc))
+            if not shown:
+                continue
+            new = shown[0]
+            if new != top:                                               # the content moves with the range
+                for d in (self.value, self.formula, self.fmt):
+                    if top in d:
+                        d[new] = d.pop(top)
+            for rc in shown:
+                anchor[rc] = new
+        self.anchor = anchor
+        for d in (self.value, self.formula, self.fmt):
+            for rc in [rc for rc in d if hidden(rc)]:
+                del d[rc]
+
+        # close up: row r becomes r minus the hidden rows above it (columns likewise)
+        hr, hc = sorted(rows), sorted(cols)
+        new = lambda rc: (rc[0] - bisect_left(hr, rc[0]), rc[1] - bisect_left(hc, rc[1]))
+        self.value = {new(rc): v for rc, v in self.value.items()}
+        self.formula = {new(rc): v for rc, v in self.formula.items()}
+        self.fmt = {new(rc): v for rc, v in self.fmt.items()}
+        self.anchor = {new(rc): new(top) for rc, top in self.anchor.items()}
+
+        def back(x, h):                    # the visible row (column) that closed up to x
+            o = x
+            while (o2 := x + bisect_right(h, o)) != o:
+                o = o2
+            return o
+        self.unmap = lambda r, c: (back(r, hr), back(c, hc))
 
     def raw(self, r, c):
         return self.value.get((r, c))
@@ -686,10 +731,21 @@ def grid_csv(path: str, text_columns=None) -> Grid:
     return g
 
 
-def _sheet_rows(ws, merges: list | None = None):
+def _hidden(attrs: dict, size: str) -> bool:
+    """A row or column hidden in Excel: hidden="1", or a height / width of 0."""
+    if attrs.get("hidden") in ("1", "true"):
+        return True
+    try:
+        return float(attrs[size]) == 0
+    except (KeyError, ValueError):
+        return False
+
+
+def _sheet_rows(ws, merges: list | None = None, hidden: dict | None = None):
     """The cells of a read-only worksheet as openpyxl's sheet parser reads them (the same parser a
     normal load uses): dicts with row, column, value, data_type, style_id. When the rows are done,
-    the sheet's merged ranges (stored after them) are added to `merges`."""
+    the sheet's merged ranges (stored after them) are added to `merges`, and its hidden rows and
+    columns to hidden["rows"] / hidden["cols"]."""
     wb = ws.parent
     with ws._get_source() as src:
         parser = WorkSheetParser(src, ws._shared_strings, data_only=wb.data_only, epoch=wb.epoch,
@@ -698,11 +754,16 @@ def _sheet_rows(ws, merges: list | None = None):
             yield from row
         if merges is not None and parser.merged_cells:
             merges += [cr.ref for cr in parser.merged_cells.mergeCell]
+        if hidden is not None:
+            hidden["rows"] = {int(r) for r, a in parser.row_dimensions.items() if _hidden(a, "ht")}
+            hidden["cols"] = {c for a in parser.column_dimensions.values() if _hidden(a, "width")
+                              for c in range(int(a["min"]), int(a.get("max", a["min"])) + 1)}
 
 
-def grid_xlsx(ws_f, ws_v) -> Grid:
+def grid_xlsx(ws_f, ws_v, visible_only: bool = False) -> Grid:
     """One sheet, read in read-only mode: formulas from ws_f, their cached results from ws_v
-    (the same sheet of the workbook opened with data_only=True)."""
+    (the same sheet of the workbook opened with data_only=True).
+    visible_only: hidden rows and columns are left out, as on screen (see Grid.hide)."""
     styles = {}
 
     def style(ws, sid):                                  # number format and is-date, per style
@@ -715,8 +776,8 @@ def grid_xlsx(ws_f, ws_v) -> Grid:
         t = cell["data_type"]
         return t == "d" or (t == "n" and style(ws, cell["style_id"])[1])
 
-    g, merges = Grid(), []
-    for cell in _sheet_rows(ws_f, merges):
+    g, merges, hidden = Grid(), [], {} if visible_only else None
+    for cell in _sheet_rows(ws_f, merges, hidden):
         d = is_date(ws_f, cell)
         g.put((cell["row"], cell["column"]), cell["value"], d, style(ws_f, cell["style_id"])[0] if d else None)
     g.merge(merges)
@@ -729,21 +790,26 @@ def grid_xlsx(ws_f, ws_v) -> Grid:
                 g.value[rc] = cell["value"]
                 if is_date(ws_v, cell):
                     g.fmt[rc] = style(ws_v, cell["style_id"])[0]
+    if visible_only:
+        g.hide(hidden["rows"], hidden["cols"])
     return g
 
 
-def extract(path: str, sheets=None, text_columns=None) -> list[dict]:
+def extract(path: str, sheets=None, text_columns=None, visible_only: bool = False) -> list[dict]:
     """Every value cell of a workbook (.xlsx / .xlsm / .csv) with its labels.
     sheets: a sheet name or a list of them to read only those (default: every sheet).
     text_columns: CSV columns kept as text, by header or letter (see grid_csv).
+    visible_only: hidden rows and columns are left out, as on screen (Excel files).
 
     Returns dicts: file, sheet, table, address, row, col, value_type, value, formula,
     labels (list of Label, unordered in meaning), via (where each label came from:
     header | title | layout; same order as labels)."""
-    return [c for sheet in extract_sheets(path, sheets, text_columns=text_columns) for c in sheet.dicts()]
+    return [c for sheet in extract_sheets(path, sheets, text_columns=text_columns, visible_only=visible_only)
+            for c in sheet.dicts()]
 
 
-def extract_sheets(path: str, sheets=None, names: list | None = None, text_columns=None):
+def extract_sheets(path: str, sheets=None, names: list | None = None, text_columns=None,
+                   visible_only: bool = False):
     """Like extract(), one sheet at a time: yields the value cells of each sheet as SheetCells.
     Only one sheet's grid and cells are held at a time; sheets not asked for are not read.
     names: a list to receive the names of all sheets in the file."""
@@ -763,7 +829,7 @@ def extract_sheets(path: str, sheets=None, names: list | None = None, text_colum
             names += [ws.title for ws in wb_f.worksheets]
         for ws in wb_f.worksheets:
             if want is None or ws.title in want:
-                yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title]))
+                yield _sheet_cells(name, ws.title, grid_xlsx(ws, wb_v[ws.title], visible_only))
     finally:
         wb_v.close()
         wb_f.close()
@@ -772,8 +838,14 @@ def extract_sheets(path: str, sheets=None, names: list | None = None, text_colum
 def _sheet_cells(name: str, sheet: str, g: Grid) -> SheetCells:
     """The value cells of one worksheet with their labels."""
     out = SheetCells(name, sheet)
-    label_id = out.labels.id
     layout = Layout(g)
+    um = g.unmap                                  # visible_only: grid positions -> sheet positions
+    if um is None:
+        label_id = out.labels.id
+    else:
+        def label_id(lb, via):
+            o = um(*lb.origin) if lb.origin else None
+            return out.labels.id(Label(lb.text, lb.date_value, o), via)
 
     # tables, and label-only blocks just above them (captions)
     parts = {}
@@ -833,7 +905,11 @@ def _sheet_cells(name: str, sheet: str, g: Grid) -> SheetCells:
             return floors[c]
 
         c0, c1 = box[1], box[3]
-        tc = TableCells(t.ref)
+        if um is None:
+            tc = TableCells(t.ref)
+        else:
+            (a, b), (y, z) = um(box[0], box[1]), um(box[2], box[3])        # the table's span on the sheet
+            tc = TableCells(f"{get_column_letter(b)}{a}:{get_column_letter(z)}{y}")
         out.tables.append(tc)
         for r, c, header in table_cells(g, t):
             v = cell_value(g.raw(r, c), (r, c) in g.formula)
@@ -848,6 +924,6 @@ def _sheet_cells(name: str, sheet: str, g: Grid) -> SheetCells:
                     if lb.key() not in seen:              # first source wins: header > title > layout
                         seen.add(lb.key())
                         ids.append(label_id(lb, src))
-            tc.add(r, c, v[0], v[1], g.formula.get((r, c)), ids)
+            tc.add(*(um(r, c) if um else (r, c)), v[0], v[1], g.formula.get((r, c)), ids)
     out.tables = [tc for tc in out.tables if len(tc)]
     return out
