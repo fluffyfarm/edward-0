@@ -5,3 +5,5 @@
 
 data/
 *.ipynb
+test/
+tests/
